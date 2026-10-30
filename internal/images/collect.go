@@ -65,7 +65,7 @@ type Resolved struct {
 	puller *remote.Puller
 }
 
-func (c *Collector) puller(internal bool) (*remote.Puller, error) {
+func (c *Collector) puller(internal bool, host string) (*remote.Puller, error) {
 	auth := authn.Anonymous
 	if internal && c.Auth != nil {
 		auth = c.Auth
@@ -74,11 +74,31 @@ func (c *Collector) puller(internal bool) (*remote.Puller, error) {
 	if t == nil {
 		t = remote.DefaultTransport
 	}
+	if !slices.Contains(c.InsecureRegistries, host) {
+		// ggcr falls back to plain HTTP for localhost, loopback, .local and
+		// RFC 1918 hosts; only hosts listed as insecure may use it.
+		t = &httpsOnly{inner: t, host: host}
+	}
 	opts := []remote.Option{remote.WithAuth(auth), remote.WithTransport(t)}
 	if c.UserAgent != "" {
 		opts = append(opts, remote.WithUserAgent(c.UserAgent))
 	}
 	return remote.NewPuller(opts...)
+}
+
+// httpsOnly refuses plain-HTTP requests to a registry host. Requests to
+// other hosts (blob redirects to storage, which get no credentials and are
+// checked by digest) pass.
+type httpsOnly struct {
+	inner http.RoundTripper
+	host  string
+}
+
+func (t *httpsOnly) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Scheme != "https" && r.URL.Host == t.host {
+		return nil, fmt.Errorf("refusing plain HTTP to registry %s; only hosts in --insecure-registries may use it", t.host)
+	}
+	return t.inner.RoundTrip(r)
 }
 
 // ref is "<reference minus :tag>@<digest>".
@@ -110,7 +130,7 @@ func (c *Collector) Resolve(ctx context.Context, img api.ManifestImage, platform
 	if internal && ref.Context().RegistryStr() != c.RegistryHost {
 		return nil, fmt.Errorf("image %s is marked internal but isn't on %s", img.Reference, c.RegistryHost)
 	}
-	p, err := c.puller(internal)
+	p, err := c.puller(internal, ref.Context().RegistryStr())
 	if err != nil {
 		return nil, err
 	}

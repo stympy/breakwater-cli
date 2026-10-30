@@ -32,6 +32,10 @@ Version is set with `-ldflags "-X github.com/stympy/breakwater-cli/internal/vers
 - An `internal` image whose host isn't `--registry-host` is an error; a file URL not on the `--host` origin is an error.
 - Every HTTP request sends `User-Agent: breakwater-cli/<version>`.
 
+## Registries over plain HTTP
+
+Registries are reached only over HTTPS. ggcr would fall back to plain HTTP for localhost, loopback, `.local` and RFC 1918 hosts; the Collector refuses that unless the host is in the hidden `--insecure-registries` flag (comma-separated hosts). Local development against a plain-HTTP registry or proxy needs it, e.g. `breakwater bundle create api 1.0.0 --host http://localhost:3000 --registry-host localhost:5000 --insecure-registries localhost:5000`.
+
 ## Hostile-bundle rules
 
 Treat a bundle as hostile on the offline side. Truncation, a flipped byte, an extra or duplicate entry, `../x`, symlinks, huge declared sizes, or `bundle.json` not being first must make `verify` and `load` fail clearly, with nothing written or pushed. Files written under a user-given directory go through `os.Root`.

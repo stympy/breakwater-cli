@@ -429,3 +429,73 @@ func sha256Hex(b []byte) string {
 	h, _, _ := v1.SHA256(strings.NewReader(string(b)))
 	return h.Hex
 }
+
+func TestBundleCreateRefusesAnExistingPartial(t *testing.T) {
+	f := newCreateFixture(t)
+	if err := os.Symlink(filepath.Join(t.TempDir(), "target"), f.out+".partial"); err != nil {
+		t.Fatal(err)
+	}
+	ios, _, errb := testIO("", testEnv)
+	if code := execute(ios, f.args()); code != 1 || !strings.Contains(errb.String(), f.out+".partial exists (another bundle create running, or a stale one); remove it and try again") {
+		t.Fatalf("exit %d: %s", code, errb)
+	}
+	if fi, err := os.Lstat(f.out + ".partial"); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the existing .partial was touched: %v", err)
+	}
+	if _, err := os.Stat(f.out); !os.IsNotExist(err) {
+		t.Fatal("output written")
+	}
+}
+
+func TestPublishDoesNotOverwriteWithoutForce(t *testing.T) {
+	dir := t.TempDir()
+	partial, out := filepath.Join(dir, "b.partial"), filepath.Join(dir, "b")
+	os.WriteFile(partial, []byte("new"), 0o644)
+	os.WriteFile(out, []byte("raced in"), 0o644)
+	if err := publish(partial, out, false); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("got %v", err)
+	}
+	if data, _ := os.ReadFile(out); string(data) != "raced in" {
+		t.Fatal("overwritten")
+	}
+	if err := publish(partial, out, true); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(out); string(data) != "new" {
+		t.Fatal("not replaced with --force")
+	}
+	os.WriteFile(partial, []byte("fresh"), 0o644)
+	os.Remove(out)
+	if err := publish(partial, out, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Fatal("partial left after publishing")
+	}
+}
+
+func TestBundleCreateCapsReleaseFiles(t *testing.T) {
+	for _, tc := range []struct {
+		sizes []int64
+		want  string
+	}{
+		{[]int64{1<<20 + 1}, "release file f0 is 1.0 MiB, over the 1.0 MiB limit"},
+		{[]int64{1 << 20, 1 << 20, 1 << 20, 1 << 20, 1 << 20, 1}, "the release's files total 5.0 MiB, over the 5.0 MiB limit"},
+	} {
+		f := newCreateFixture(t)
+		f.api.manifest.Files = nil
+		for i, size := range tc.sizes {
+			f.api.manifest.Files = append(f.api.manifest.Files, api.ManifestFile{
+				Name: fmt.Sprintf("f%d", i), Size: size, SHA256: strings.Repeat("a", 64),
+				URL: f.api.srv.URL + "/x",
+			})
+		}
+		ios, _, errb := testIO("", testEnv)
+		if code := execute(ios, f.args()); code != 1 || !strings.Contains(errb.String(), tc.want) {
+			t.Fatalf("exit %d: %s", code, errb)
+		}
+		if len(f.api.started) != 0 {
+			t.Fatal("bundle event started")
+		}
+	}
+}

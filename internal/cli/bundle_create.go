@@ -29,8 +29,14 @@ import (
 	"github.com/stympy/breakwater-cli/internal/version"
 )
 
-// maxEventPlatforms is the most platforms a bundle event takes.
-const maxEventPlatforms = 16
+const (
+	// maxEventPlatforms is the most platforms a bundle event takes.
+	maxEventPlatforms = 16
+	// maxFileSize and maxFilesTotal cap release files, which are held in
+	// memory while the bundle is written.
+	maxFileSize   = 1 << 20
+	maxFilesTotal = 5 << 20
+)
 
 type createOptions struct {
 	product, version string
@@ -127,6 +133,9 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 	if err != nil {
 		return err
 	}
+	for i, p := range o.cliBinaries {
+		o.cliBinaries[i] = strings.TrimSpace(p)
+	}
 	if len(o.cliBinaries) > 0 {
 		if err := selfdist.Check(version.Version, o.cliBinaries); err != nil {
 			return err
@@ -154,6 +163,9 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 	client := api.New(origin, creds)
 	m, rawManifest, err := client.Manifest(ctx, o.product, o.version)
 	if err != nil {
+		return err
+	}
+	if err := checkFileSizes(m.Files); err != nil {
 		return err
 	}
 
@@ -199,8 +211,8 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 		return err
 	}
 	bins := []selfdist.Binary{running}
-	if len(o.cliBinaries) > 0 {
-		fmt.Fprintf(stderr, "Downloading breakwater %s for %s\n", version.Version, strings.Join(o.cliBinaries, ", "))
+	if others := selfdist.Others(o.cliBinaries); len(others) > 0 {
+		fmt.Fprintf(stderr, "Downloading breakwater %s for %s\n", version.Version, strings.Join(others, ", "))
 		downloaded, err := selfdist.Download(ctx, version.Version, o.cliBinaries, &http.Client{}, "")
 		if err != nil {
 			return err
@@ -234,6 +246,20 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 	fmt.Fprintf(stdout, "Wrote %s (%s): %s, %s\n", out, humanSize(st.Size()), plural(len(m.Images), "image"), plural(len(m.Files), "file"))
 	fmt.Fprintf(stdout, "Next: carry it across, then run: breakwater bundle load %s --docker\n", out)
 	fmt.Fprintf(stdout, "      (or --registry <host>[/<prefix>] to push the images to a private registry)\n")
+	return nil
+}
+
+func checkFileSizes(files []api.ManifestFile) error {
+	var total int64
+	for _, f := range files {
+		if f.Size > maxFileSize {
+			return fmt.Errorf("release file %s is %s, over the %s limit for a file in a bundle", f.Name, humanSize(f.Size), humanSize(maxFileSize))
+		}
+		total += f.Size
+	}
+	if total > maxFilesTotal {
+		return fmt.Errorf("the release's files total %s, over the %s limit for a bundle", humanSize(total), humanSize(maxFilesTotal))
+	}
 	return nil
 }
 
@@ -367,7 +393,11 @@ func planBundle(m *api.Manifest, rawManifest json.RawMessage, platforms []string
 // and nothing is left at out.
 func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bundlePlan, out string, force bool) (err error) {
 	partial := out + ".partial"
-	f, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	// O_EXCL: never reuse or follow whatever is there, symlinks included.
+	f, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("%s exists (another bundle create running, or a stale one); remove it and try again", partial)
+	}
 	if err != nil {
 		return err
 	}
@@ -439,19 +469,36 @@ func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bund
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if !force {
-		if err := refuseExisting(out); err != nil {
-			return err
-		}
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Rename(partial, out); err != nil {
+	if err := publish(partial, out, force); err != nil {
 		return err
 	}
 	syncDir(filepath.Dir(out))
 	return nil
+}
+
+// publish moves the finished partial to out. With force it renames over
+// out. Without, it hard-links, which fails if out exists, so nothing
+// created meanwhile is overwritten; where links aren't supported it
+// re-checks and renames.
+func publish(partial, out string, force bool) error {
+	if force {
+		return os.Rename(partial, out)
+	}
+	err := os.Link(partial, out)
+	if err == nil {
+		os.Remove(partial)
+		return nil
+	}
+	if errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("%s already exists; use --force to overwrite it", out)
+	}
+	if err := refuseExisting(out); err != nil {
+		return err
+	}
+	return os.Rename(partial, out)
 }
 
 func addBlob(ctx context.Context, w *bundle.Writer, col *images.Collector, r *images.Resolved, e entry) error {

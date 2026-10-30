@@ -94,6 +94,19 @@ func Check(version string, platforms []string) error {
 	return nil
 }
 
+// Others are the platforms Download would fetch: platforms without the
+// running one, each once.
+func Others(platforms []string) []string {
+	running := runtime.GOOS + "/" + runtime.GOARCH
+	var out []string
+	for _, p := range platforms {
+		if p != running && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // Download fetches the released breakwater binaries for platforms (except
 // the running platform, which the caller adds with Running) into temporary
 // files, checked against the release's checksums.txt. baseURL defaults to
@@ -110,14 +123,7 @@ func Download(ctx context.Context, version string, platforms []string, client *h
 		baseURL = releaseURL(version)
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
-	running := runtime.GOOS + "/" + runtime.GOARCH
-
-	var want []string
-	for _, p := range platforms {
-		if p != running && !slices.Contains(want, p) {
-			want = append(want, p)
-		}
-	}
+	want := Others(platforms)
 	if len(want) == 0 {
 		return nil, nil
 	}
@@ -130,8 +136,14 @@ func Download(ctx context.Context, version string, platforms []string, client *h
 	sc := bufio.NewScanner(&buf)
 	for sc.Scan() {
 		if m := checksumLine.FindStringSubmatch(strings.TrimSpace(sc.Text())); m != nil {
+			if prev, ok := sums[m[2]]; ok && prev != m[1] {
+				return nil, fmt.Errorf("checksums.txt of breakwater %s lists %s twice with different checksums", version, m[2])
+			}
 			sums[m[2]] = m[1]
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("reading checksums.txt of breakwater %s: %w", version, err)
 	}
 
 	var bins []Binary

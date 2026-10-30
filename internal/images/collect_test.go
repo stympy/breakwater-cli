@@ -530,3 +530,104 @@ func TestForeignLayersComeFromTheRegistry(t *testing.T) {
 		}
 	}
 }
+
+// A registry on a loopback host not listed as insecure is reached only over
+// HTTPS: ggcr's localhost fallback to plain HTTP is refused.
+func TestUnlistedLocalRegistryIsNotReachedOverHTTP(t *testing.T) {
+	var plain authLog
+	r := newTestRegistry(t, func(reg http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			plain.record(req)
+			reg.ServeHTTP(w, req)
+		})
+	})
+	img := randomImage(t)
+	for _, kind := range []string{"internal", "external"} {
+		mi := r.push(t, "acme/api:2.4.1", kind, img)
+		c := collector(r)
+		c.InsecureRegistries = nil
+		if _, err := c.Resolve(context.Background(), mi, nil); err == nil {
+			t.Fatalf("%s: resolved over plain HTTP", kind)
+		}
+	}
+	if seen := plain.all(); len(seen) != 0 {
+		t.Fatalf("the plain-HTTP registry was contacted: %v", seen)
+	}
+}
+
+// The bearer flow: the token endpoint gets Basic credentials, the registry
+// gets the bearer token, and a blob redirect to storage carries neither.
+func TestBearerFlowBlobRedirectCarriesNoCredentials(t *testing.T) {
+	var storageLog, tokenLog authLog
+	var registryURL string
+	r := newTestRegistry(t, func(reg http.Handler) http.Handler {
+		storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			storageLog.record(req)
+			req.Header.Del("Authorization")
+			reg.ServeHTTP(w, req)
+		}))
+		t.Cleanup(storage.Close)
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == "/token" {
+				tokenLog.record(req)
+				if u, p, ok := req.BasicAuth(); !ok || u != "ctok_x" || p != "secret" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"token":"tok123","access_token":"tok123"}`))
+				return
+			}
+			if req.Header.Get("Authorization") != "Bearer tok123" {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="`+registryURL+`/token",service="test"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/blobs/") {
+				http.Redirect(w, req, storage.URL+req.URL.Path, http.StatusTemporaryRedirect)
+				return
+			}
+			reg.ServeHTTP(w, req)
+		})
+	})
+	registryURL = "http://" + r.Host
+	img := randomImage(t)
+	mi := r.push(t, "acme/api:2.4.1", "internal", img)
+	c := collector(r)
+	res, err := c.Resolve(context.Background(), mi, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range res.Blobs {
+		rc, err := c.FetchBlob(context.Background(), res, d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h, _, _ := v1.SHA256(bytes.NewReader(got)); h != d.Digest {
+			t.Fatalf("blob %s arrived as %s", d.Digest, h)
+		}
+	}
+	tokens := tokenLog.all()
+	if len(tokens) == 0 {
+		t.Fatal("the token endpoint was never called")
+	}
+	for _, s := range tokens {
+		if !strings.Contains(s, " Basic ") {
+			t.Fatalf("token request without Basic: %q", s)
+		}
+	}
+	seen := storageLog.all()
+	if len(seen) < len(res.Blobs) {
+		t.Fatalf("storage saw %v", seen)
+	}
+	for _, s := range seen {
+		if !strings.HasSuffix(s, " ") {
+			t.Fatalf("storage got credentials: %q", s)
+		}
+	}
+}

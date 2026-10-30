@@ -167,3 +167,32 @@ func TestRunningHashesTheExecutable(t *testing.T) {
 		t.Fatalf("got %+v", b)
 	}
 }
+
+func TestDownloadRefusesConflictingChecksums(t *testing.T) {
+	p := otherPlatforms()[0]
+	n := assetName("1.2.3", p)
+	data := []byte("binary")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/checksums.txt" {
+			fmt.Fprintf(w, "%s  %s\n%s  %s\n", sum(data), n, sum([]byte("other")), n)
+			return
+		}
+		w.Write(data)
+	}))
+	t.Cleanup(srv.Close)
+	_, err := Download(context.Background(), "1.2.3", []string{p}, srv.Client(), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "twice with different checksums") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestOthersSkipsTheRunningPlatform(t *testing.T) {
+	running := runtime.GOOS + "/" + runtime.GOARCH
+	others := otherPlatforms()
+	if got := Others([]string{running, running}); len(got) != 0 {
+		t.Fatalf("got %v", got)
+	}
+	if got := Others(append(others, others[0], running)); len(got) != len(others) {
+		t.Fatalf("got %v", got)
+	}
+}
