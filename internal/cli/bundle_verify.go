@@ -26,7 +26,7 @@ func newBundleCommand(g *globals) *cobra.Command {
 func newBundleVerifyCommand(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:   "verify <file>",
-		Short: "Check a bundle's structure and every digest in it",
+		Short: "Check a bundle's structure and every entry against the digests in its bundle.json",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := args[0]
@@ -65,7 +65,7 @@ func printBundleSummary(g *globals, b *bundle.Bundle) {
 		if img.Platforms == 1 {
 			noun = "platform"
 		}
-		fmt.Fprintf(tw, "  %s@%s\t%d %s\t%s\n", clean(img.Reference), clean(shortDigest(img.Digest)), img.Platforms, noun, humanSize(img.Size))
+		fmt.Fprintf(tw, "  %s@%s\t%d %s\t%s\n", clean(img.Reference), clean(img.Digest), img.Platforms, noun, humanSize(img.Size))
 	}
 	tw.Flush()
 
@@ -83,21 +83,13 @@ func printBundleSummary(g *globals, b *bundle.Bundle) {
 	}
 	tw.Flush()
 
-	fmt.Fprintln(out, "\nOK: every image, file and binary matches its digest.")
+	fmt.Fprintln(out, "\nOK: every entry matches the digests recorded in bundle.json.")
+	fmt.Fprintf(out, "Bundle SHA-256: %s\n", b.SHA256())
 }
 
 // clean drops control and format characters (escape sequences, bidi
 // overrides) from bundle-supplied text before it reaches a terminal.
 func clean(s string) string { return term.Clean(s) }
-
-// shortDigest is "sha256:" and the first 12 hex characters.
-func shortDigest(d string) string {
-	algo, hex, ok := strings.Cut(d, ":")
-	if !ok || len(hex) <= 12 {
-		return d
-	}
-	return algo + ":" + hex[:12]
-}
 
 // humanSize is a byte count in binary units: "512 B", "1.5 KiB", "2.0 GiB".
 func humanSize(n int64) string {

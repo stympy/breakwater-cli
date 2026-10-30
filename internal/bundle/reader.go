@@ -35,7 +35,10 @@ func (e IndexEntry) Location() Location { return Location{Offset: e.Offset, Size
 // data offsets.
 type Index struct {
 	Entries []IndexEntry
-	byPath  map[string]int
+	// SHA256 is the lowercase hex SHA-256 of the whole bundle file, as
+	// Scan read it.
+	SHA256 string
+	byPath map[string]int
 }
 
 // Lookup returns the location of path's data. The offset is where the entry
@@ -108,14 +111,17 @@ func isSparse(hdr *tar.Header) bool {
 // Scan reads a bundle once, front to back, and checks it: bundle.json comes
 // first and within its cap, the format is one this package reads, and every
 // later entry is a regular file at a clean declared path, present once, of
-// the declared size and SHA-256. Every declared entry must be present.
+// the declared size and SHA-256. Every declared entry must be present, and
+// the archive must end with tar's end-of-archive marker followed by nothing
+// but zero padding. The index records the whole file's SHA-256.
 //
 // visit, if not nil, is called with each entry's body as it streams past;
 // Scan drains whatever visit doesn't read. The body hasn't been checked
 // against its digest when visit sees it: nothing visit does with the bytes
 // may be trusted or made visible until Scan returns without an error.
 func Scan(r io.Reader, visit func(e Entry, body io.Reader) error) (*Header, *Index, error) {
-	cr := &countingReader{r: r}
+	fileHash := sha256.New()
+	cr := &countingReader{r: io.TeeReader(r, fileHash)}
 	tr := tar.NewReader(cr)
 
 	hdr, err := tr.Next()
@@ -138,10 +144,13 @@ func Scan(r io.Reader, visit func(e Entry, body io.Reader) error) (*Header, *Ind
 	if hdr.Size > MaxHeaderSize {
 		return nil, nil, fmt.Errorf("bundle.json is %d bytes, over the 32 MiB limit", hdr.Size)
 	}
+	headerOffset := cr.n
 	raw, err := io.ReadAll(tr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("bundle.json is truncated: %w", err)
 	}
+	// dataEnd is where the last entry's data, padded to a block, ends.
+	dataEnd := blockEnd(headerOffset, hdr.Size)
 
 	var probe struct {
 		Format int `json:"format"`
@@ -201,6 +210,7 @@ func Scan(r io.Reader, visit func(e Entry, body io.Reader) error) (*Header, *Ind
 			return nil, nil, fmt.Errorf("entry %q is %d bytes; bundle.json declares %d", name, hdr.Size, ie.Size)
 		}
 		ie.Offset = offset
+		dataEnd = blockEnd(offset, hdr.Size)
 		last = name
 
 		body := &hashingReader{r: tr, h: sha256.New()}
@@ -224,8 +234,43 @@ func Scan(r io.Reader, visit func(e Entry, body io.Reader) error) (*Header, *Ind
 			return nil, nil, fmt.Errorf("declared entry %q is missing from the bundle", e.Path)
 		}
 	}
+	if err := checkTrailer(cr, dataEnd); err != nil {
+		return nil, nil, err
+	}
+	idx.SHA256 = hex.EncodeToString(fileHash.Sum(nil))
 	h := doc.Header
 	return &h, idx, nil
+}
+
+// blockEnd is where data of size bytes at offset ends, padded to tar's
+// 512-byte blocks.
+func blockEnd(offset, size int64) int64 {
+	return offset + (size+511)/512*512
+}
+
+// checkTrailer runs after archive/tar reports the end of the archive, which
+// it also does for an archive cut off at an entry boundary. The two zero
+// blocks of the end-of-archive marker must have been read right after the
+// last entry, and anything after them must be zero padding.
+func checkTrailer(cr *countingReader, dataEnd int64) error {
+	if cr.n != dataEnd+1024 {
+		return errors.New("the bundle doesn't end with tar's end-of-archive marker; it's truncated")
+	}
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := cr.Read(buf)
+		for _, c := range buf[:n] {
+			if c != 0 {
+				return errors.New("the bundle has data after its end-of-archive marker")
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("reading the end of the bundle: %w", err)
+		}
+	}
 }
 
 // Bundle is an opened, scanned and validated bundle file.
@@ -272,6 +317,10 @@ func open(f *os.File) (*Bundle, error) {
 
 // Header returns bundle.json without its entries.
 func (b *Bundle) Header() *Header { return b.header }
+
+// SHA256 is the lowercase hex SHA-256 of the whole bundle file, as Open
+// read it.
+func (b *Bundle) SHA256() string { return b.index.SHA256 }
 
 // Index returns the bundle's entries and their offsets.
 func (b *Bundle) Index() *Index { return b.index }

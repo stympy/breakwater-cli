@@ -13,6 +13,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/stympy/breakwater-cli/internal/api"
+	"github.com/stympy/breakwater-cli/internal/term"
 )
 
 var (
@@ -79,7 +80,10 @@ type validator struct {
 
 type imageKey struct{ kind, reference, tag, repositoryPath, digest string }
 
+// describe names an image in errors. bundle.json is hostile input, so
+// control characters (newlines and tabs too) are dropped.
 func describe(reference, tag string) string {
+	reference, tag = term.Clean(reference), term.Clean(tag)
 	if tag != "" && !strings.HasSuffix(reference, ":"+tag) {
 		return fmt.Sprintf("%s (tag %s)", reference, tag)
 	}
@@ -221,7 +225,7 @@ func (v *validator) count() error {
 func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 	info := ImageInfo{Reference: img.Reference, Digest: img.Digest, MediaType: img.MediaType}
 	if img.MediaType != mi.MediaType {
-		return info, fmt.Errorf("media type %s in bundle.json doesn't match the manifest's %s", img.MediaType, mi.MediaType)
+		return info, fmt.Errorf("media type %q in bundle.json doesn't match the manifest's %q", img.MediaType, mi.MediaType)
 	}
 	mt := types.MediaType(img.MediaType)
 	switch {
@@ -234,7 +238,7 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 			return info, fmt.Errorf("bundle.json lists children for a manifest")
 		}
 	default:
-		return info, fmt.Errorf("unsupported media type %s", mt)
+		return info, fmt.Errorf("unsupported media type %q", mt)
 	}
 	if err := v.count(); err != nil {
 		return info, err
@@ -281,12 +285,12 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 	kept := map[string]bool{}
 	for _, c := range img.Children {
 		if kept[c] {
-			return info, fmt.Errorf("bundle.json lists child %s twice", c)
+			return info, fmt.Errorf("bundle.json lists child %q twice", c)
 		}
 		kept[c] = true
 		ch, err := v1.NewHash(c)
 		if err != nil {
-			return info, fmt.Errorf("child %s isn't in its index", c)
+			return info, fmt.Errorf("child %q isn't in its index", c)
 		}
 		d, ok := descs[ch]
 		if !ok {
@@ -505,7 +509,7 @@ func (v *validator) files(m *api.Manifest) error {
 			return fmt.Errorf("file %q has an unsafe name", f.Name)
 		}
 		if _, dup := inHeader[f.Name]; dup {
-			return fmt.Errorf("bundle.json lists file %s twice", f.Name)
+			return fmt.Errorf("bundle.json lists file %q twice", f.Name)
 		}
 		inHeader[f.Name] = f
 	}
@@ -514,7 +518,7 @@ func (v *validator) files(m *api.Manifest) error {
 		inManifest[mf.Name] = true
 		f, ok := inHeader[mf.Name]
 		if !ok {
-			return fmt.Errorf("file %s is in the manifest but not in bundle.json", mf.Name)
+			return fmt.Errorf("file %q is in the manifest but not in bundle.json", mf.Name)
 		}
 		if f.Size != mf.Size || f.SHA256 != mf.SHA256 {
 			return fmt.Errorf("file %s: bundle.json's size or sha256 doesn't match the manifest", mf.Name)
@@ -522,7 +526,7 @@ func (v *validator) files(m *api.Manifest) error {
 	}
 	for _, f := range v.h.Files {
 		if !inManifest[f.Name] {
-			return fmt.Errorf("file %s is in bundle.json but not in the manifest", f.Name)
+			return fmt.Errorf("file %q is in bundle.json but not in the manifest", f.Name)
 		}
 		e, err := v.need(FilePath(f.Name), -1)
 		if err != nil {

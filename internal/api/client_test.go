@@ -184,6 +184,15 @@ func TestManifestRefusals(t *testing.T) {
 		{"repo path uppercase", mod(func(m map[string]any) { img(m)["repository_path"] = "v/App" }), "invalid repository_path"},
 		{"repo path control char", mod(func(m map[string]any) { img(m)["repository_path"] = "v/a\x1bpp" }), "invalid repository_path"},
 		{"internal no tag", mod(func(m map[string]any) { img(m)["tag"] = "" }), "no repository_path or tag"},
+		{"reference doesn't parse", mod(func(m map[string]any) { img(m)["reference"] = "r.example/V/App:1" }), "it doesn't parse"},
+		{"reference with a newline", mod(func(m map[string]any) { img(m)["reference"] = "r.example/v/app:1\nok" }), "it doesn't parse"},
+		{"reference without a tag", mod(func(m map[string]any) { img(m)["reference"] = "r.example:5000/v/app" }), "it must name a tag"},
+		{"no size", mod(func(m map[string]any) { img(m)["size"] = 0 }), "has no size or media type; ask the vendor to republish"},
+		{"no media type", mod(func(m map[string]any) { img(m)["media_type"] = "" }), "has no size or media type; ask the vendor to republish"},
+		{"incomplete reason with a newline", mod(func(m map[string]any) {
+			m["incomplete"] = true
+			m["incomplete_reasons"] = []string{"image a\nis\tmissing"}
+		}), "incomplete: image ais"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

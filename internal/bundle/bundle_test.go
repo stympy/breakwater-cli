@@ -176,7 +176,7 @@ func TestValidateFailures(t *testing.T) {
 		}, "image docker.io/library/redis:7: child " + other + " isn't in its index"},
 		{"index child listed twice", func(f *fixture) {
 			f.opts.EditHeader = func(h *bundle.Header) { h.Images[1].Children = append(h.Images[1].Children, h.Images[1].Children[0]) }
-		}, "lists child sha256:"},
+		}, "lists child \"sha256:"},
 		{"subset of children with platforms null", func(f *fixture) {
 			im, _ := f.index.IndexManifest()
 			f.opts.Images[1].Children = []v1.Hash{im.Manifests[0].Digest}
@@ -215,13 +215,13 @@ func TestValidateFailures(t *testing.T) {
 		}, "image registry.breakwaterapp.com/acme/api:2.4.1: its manifest blob is "},
 		{"media type differs", func(f *fixture) {
 			f.opts.EditHeader = func(h *bundle.Header) { h.Images[0].MediaType = "application/vnd.oci.image.manifest.v1+json" }
-		}, "image registry.breakwaterapp.com/acme/api:2.4.1: media type application/vnd.oci.image.manifest.v1+json in bundle.json doesn't match the manifest's"},
+		}, "image registry.breakwaterapp.com/acme/api:2.4.1: media type \"application/vnd.oci.image.manifest.v1+json\" in bundle.json doesn't match the manifest's"},
 		{"file sha differs from the manifest", func(f *fixture) {
 			f.opts.EditManifest = func(m *api.Manifest) { m.Files[0].SHA256 = strings.Repeat("cd", 32) }
 		}, "file install.sh: bundle.json's size or sha256 doesn't match the manifest"},
 		{"file in manifest only", func(f *fixture) {
 			f.opts.EditHeader = func(h *bundle.Header) { h.Files = nil }
-		}, "file install.sh is in the manifest but not in bundle.json"},
+		}, "file \"install.sh\" is in the manifest but not in bundle.json"},
 		{"file not in the bundle", func(f *fixture) {
 			f.opts.Omit = []string{"files/install.sh"}
 		}, `file install.sh: entry "files/install.sh" is missing`},

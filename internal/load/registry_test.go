@@ -370,14 +370,9 @@ func TestToRegistryRefusesPlainHTTPWithoutInsecure(t *testing.T) {
 
 func TestToRegistryRefusesBadTargets(t *testing.T) {
 	host, n := testRegistry(t)
-	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{
-		{Image: bundletest.RandomImage(t)},
-		{Kind: "external", Reference: "UPPER/x:1", Image: bundletest.RandomImage(t)},
-	}})
-	_, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "UPPER/x:1") {
-		t.Fatalf("err = %v", err)
-	}
+	// (An unparseable reference like "UPPER/x:1" can't get this far:
+	// bundle.Open refuses it.)
+	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Image: bundletest.RandomImage(t)}}})
 	for _, bad := range []string{"", "https://" + host, host + "/", host + "/UPPER", host + ":tag"} {
 		if _, err := ToRegistry(context.Background(), b, bad, nil, true, io.Discard); err == nil {
 			t.Fatalf("registry %q accepted", bad)

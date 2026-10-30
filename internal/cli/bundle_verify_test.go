@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
 	"strings"
 	"testing"
 
@@ -44,21 +47,32 @@ func TestBundleVerifyGood(t *testing.T) {
 		"  2 platforms  ",
 		"Files (1):\n  install.sh  10 B\n",
 		"Binaries (1):\n  breakwater_linux_amd64  linux/amd64  3 B\n",
-		"\nOK: every image, file and binary matches its digest.\n",
+		"\nOK: every entry matches the digests recorded in bundle.json.\n",
+		"Bundle SHA-256: " + fileSHA256(t, path) + "\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in:\n%s", want, got)
 		}
 	}
-	// digest-short: 12 hex characters after sha256:
+	// Full image digests, for comparing with the release page.
 	for _, line := range strings.Split(got, "\n") {
 		if strings.Contains(line, "@sha256:") {
 			ref := strings.Fields(line)[0]
-			if hex := ref[strings.Index(ref, "@sha256:")+8:]; len(hex) != 12 {
-				t.Errorf("short digest %q", ref)
+			if hex := ref[strings.Index(ref, "@sha256:")+8:]; len(hex) != 64 {
+				t.Errorf("digest not in full: %q", ref)
 			}
 		}
 	}
+}
+
+func fileSHA256(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func TestBundleVerifyPlatforms(t *testing.T) {
@@ -113,15 +127,16 @@ func TestBundleVerifyStripsControlCharacters(t *testing.T) {
 		t.Fatalf("out %q", out)
 	}
 
-	// Errors are cleaned too.
-	opts.EditManifest = func(m *api.Manifest) { m.Images[0].Reference = "registry.breakwaterapp.com/acme/\x1b[2Japi:2.4.1" }
-	opts.EditHeader = func(h *bundle.Header) { h.Images[0].Tag = "evil" }
+	// Errors are cleaned too, newlines and tabs included.
+	opts.EditManifest = func(m *api.Manifest) { m.Images[0].Tag = "2.4.1\n\t\x1b[2Jevil" }
+	opts.EditHeader = func(h *bundle.Header) { h.Images[0].Tag = "other" }
 	path = bundletest.Build(t, opts)
 	ios, _, errb = testIO("", nil)
 	if code := execute(ios, []string{"bundle", "verify", path}); code != 1 {
 		t.Fatalf("exit %d", code)
 	}
-	if strings.ContainsRune(errb.String(), 0x1b) || !strings.Contains(errb.String(), "acme/[2Japi:2.4.1") {
+	msg := strings.TrimSuffix(errb.String(), "\n")
+	if strings.ContainsAny(msg, "\x1b\n\t") || !strings.Contains(msg, "(tag 2.4.1[2Jevil)") {
 		t.Fatalf("stderr %q", errb)
 	}
 }

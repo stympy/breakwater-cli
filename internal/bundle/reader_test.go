@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -189,6 +190,8 @@ func TestScanRejectsHostileArchives(t *testing.T) {
 		{"truncated header", good[:700], "bundle.json is truncated"},
 		{"declared entry missing", buildTar(t, headerFor(t, []rawEntry{a, blob}, nil), a), `declared entry "oci/blobs/sha256/` + sumHex([]byte("blob")) + `" is missing from the bundle`},
 		{"gnu sparse", sparseTar(t, headerFor(t, []rawEntry{a}, nil), a), `entry "files/a.txt" is a sparse file`},
+		{"appended garbage", append(slices.Clone(good), "garbage"...), "the bundle has data after its end-of-archive marker"},
+		{"stripped trailer", good[:len(good)-1024], "the bundle doesn't end with tar's end-of-archive marker"},
 	}
 	seen := map[string]string{}
 	for _, c := range cases {
@@ -208,6 +211,38 @@ func TestScanRejectsHostileArchives(t *testing.T) {
 	}
 	if err := scanBytes(good); err != nil {
 		t.Fatalf("the untruncated archive should pass: %v", err)
+	}
+}
+
+func TestScanChecksTheEndOfArchive(t *testing.T) {
+	a := reg("files/a.txt", "hello")
+	good := buildTar(t, headerFor(t, []rawEntry{a}, nil), a)
+
+	// GNU tar pads to a 10 KiB record with zeros: fine.
+	padded := append(slices.Clone(good), make([]byte, 10240-len(good)%10240)...)
+	if err := scanBytes(padded); err != nil {
+		t.Fatalf("zero padding refused: %v", err)
+	}
+	// Half the marker, or a non-zero byte deep in the padding: refused.
+	if err := scanBytes(good[:len(good)-512]); err == nil || !strings.Contains(err.Error(), "end-of-archive marker") {
+		t.Fatalf("half a trailer: %v", err)
+	}
+	late := slices.Clone(padded)
+	late[len(late)-1] = 1
+	if err := scanBytes(late); err == nil || !strings.Contains(err.Error(), "data after its end-of-archive marker") {
+		t.Fatalf("non-zero padding: %v", err)
+	}
+}
+
+func TestScanHashesTheWholeFile(t *testing.T) {
+	a := reg("files/a.txt", "hello")
+	good := buildTar(t, headerFor(t, []rawEntry{a}, nil), a)
+	_, idx, err := Scan(bytes.NewReader(good), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx.SHA256 != sumHex(good) {
+		t.Fatalf("sha256 %s, want %s", idx.SHA256, sumHex(good))
 	}
 }
 

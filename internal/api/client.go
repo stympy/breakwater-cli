@@ -17,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/stympy/breakwater-cli/internal/credentials"
+	"github.com/stympy/breakwater-cli/internal/term"
 	"github.com/stympy/breakwater-cli/internal/version"
 )
 
@@ -254,7 +256,11 @@ func ValidateManifest(m *Manifest) error {
 		return errors.New("the release manifest has no valid format")
 	}
 	if m.Incomplete {
-		return fmt.Errorf("this release is incomplete: %s", strings.Join(m.IncompleteReasons, "; "))
+		reasons := make([]string, len(m.IncompleteReasons))
+		for i, r := range m.IncompleteReasons {
+			reasons[i] = term.Clean(r)
+		}
+		return fmt.Errorf("this release is incomplete: %s", strings.Join(reasons, "; "))
 	}
 	for i, img := range m.Images {
 		if img.Kind != "internal" && img.Kind != "external" {
@@ -265,6 +271,12 @@ func ValidateManifest(m *Manifest) error {
 		}
 		if img.Reference == "" || strings.Contains(img.Reference, "@") {
 			return fmt.Errorf("manifest image %d has an invalid reference %q (it must not contain a digest)", i+1, img.Reference)
+		}
+		if err := checkReference(img.Reference); err != nil {
+			return fmt.Errorf("manifest image %d has an invalid reference %q: %v", i+1, img.Reference, err)
+		}
+		if img.Size <= 0 || img.MediaType == "" {
+			return fmt.Errorf("release manifest image %q has no size or media type; ask the vendor to republish the release", img.Reference)
 		}
 		if img.Kind == "internal" && (img.RepositoryPath == "" || img.Tag == "") {
 			return fmt.Errorf("manifest image %q is internal but has no repository_path or tag", img.Reference)
@@ -288,6 +300,24 @@ func ValidateManifest(m *Manifest) error {
 		if f.Size < 0 {
 			return fmt.Errorf("manifest file %s has an invalid size %d", f.Name, f.Size)
 		}
+	}
+	return nil
+}
+
+// checkReference checks an image reference parses and names its tag. It
+// may leave out the registry ("postgres:16.4" is Docker Hub's), as the
+// server allows, so ggcr's StrictValidation, which refuses that, isn't used.
+func checkReference(ref string) error {
+	r, err := name.ParseReference(ref)
+	if err != nil {
+		return errors.New("it doesn't parse")
+	}
+	if _, ok := r.(name.Tag); !ok {
+		return errors.New("it must name a tag")
+	}
+	repo := ref[strings.LastIndex(ref, "/")+1:]
+	if !strings.Contains(repo, ":") {
+		return errors.New("it must name a tag")
 	}
 	return nil
 }
