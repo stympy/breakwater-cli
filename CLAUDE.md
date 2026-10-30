@@ -18,6 +18,7 @@ Version is set with `-ldflags "-X github.com/stympy/breakwater-cli/internal/vers
 
 - `cmd/breakwater`: main, calls `cli.Execute`
 - `internal/cli`: cobra commands; each subcommand file is added in `newRootCommand`; `globals` carries the persistent flags
+- `internal/api`: customer API client (never follows redirects; file downloads only from the API origin)
 - `internal/credentials`: credential resolution
 - `internal/version`: version and User-Agent
 

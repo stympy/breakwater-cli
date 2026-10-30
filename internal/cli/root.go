@@ -96,6 +96,7 @@ func newRootCommand(ios *IOStreams) *cobra.Command {
 	f.BoolVar(&g.passwordStdin, "password-stdin", false, "read the password (a pull token) from stdin")
 
 	root.AddCommand(newVersionCommand(g))
+	root.AddCommand(newReleasesCommand(g))
 	return root
 }
 
