@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/stympy/breakwater-cli/internal/bundle"
 	"github.com/stympy/breakwater-cli/internal/images"
 	"github.com/stympy/breakwater-cli/internal/term"
+	"github.com/stympy/breakwater-cli/internal/transport"
 	"github.com/stympy/breakwater-cli/internal/version"
 )
 
@@ -83,8 +85,9 @@ type target struct {
 // under the tag: as is when the bundle keeps all of it (so its digest is
 // unchanged), the one kept child when an index keeps one, or a new index
 // listing the kept children. auth may be nil (anonymous). The registry is
-// reached over HTTPS only unless insecure is set.
-func ToRegistry(ctx context.Context, b *bundle.Bundle, registry string, auth authn.Authenticator, insecure bool, out io.Writer) ([]Mapping, error) {
+// reached over HTTPS only unless insecure is set. tr defaults to
+// transport.New(nil).
+func ToRegistry(ctx context.Context, b *bundle.Bundle, registry string, auth authn.Authenticator, insecure bool, tr http.RoundTripper, out io.Writer) ([]Mapping, error) {
 	host, targets, err := planTargets(b.Header().Images, registry, insecure)
 	if err != nil {
 		return nil, err
@@ -93,9 +96,11 @@ func ToRegistry(ctx context.Context, b *bundle.Bundle, registry string, auth aut
 	if auth == nil {
 		auth = authn.Anonymous
 	}
-	transport := remote.DefaultTransport
+	if tr == nil {
+		tr = transport.New(nil)
+	}
 	if !insecure {
-		transport = images.HTTPSOnly(transport, host, "pass --insecure to allow it")
+		tr = images.HTTPSOnly(tr, host, "pass --insecure to allow it")
 	}
 	p := &pusher{
 		b:      b,
@@ -103,7 +108,7 @@ func ToRegistry(ctx context.Context, b *bundle.Bundle, registry string, auth aut
 		opts: []remote.Option{
 			remote.WithContext(ctx),
 			remote.WithAuth(auth),
-			remote.WithTransport(transport),
+			remote.WithTransport(tr),
 			remote.WithUserAgent(version.UserAgent()),
 			remote.WithNondistributable, // the bundle carries foreign layers; the target needs them
 		},

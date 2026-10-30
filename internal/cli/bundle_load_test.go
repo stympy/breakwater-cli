@@ -227,3 +227,84 @@ func TestBundleLoadChecksTheRegistryBeforeVerifying(t *testing.T) {
 		t.Fatalf("exit %d, stderr %q", code, errb)
 	}
 }
+
+func TestBundleLoadToDockerRefusesCredentialsAndStrayFlags(t *testing.T) {
+	path, _ := loadFixture(t)
+	docker := cliFakeDocker(t, "linux/amd64")
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--docker", "--username", "u"}, "--username and --password-stdin only apply to --registry"},
+		{[]string{"--docker", "--password-stdin"}, "--username and --password-stdin only apply to --registry"},
+		{[]string{"--registry", "reg.example.com", "--platform", "linux/amd64"}, "--platform only applies to --docker"},
+		{[]string{"--docker", "--platform", "Linux/AMD64"}, `invalid platform "Linux/AMD64"`},
+	} {
+		ios, _, errb := testIO("secret\n", testEnv)
+		args := append([]string{"bundle", "load", path, "--docker-command", docker}, tc.args...)
+		if code := execute(ios, args); code != 1 || !strings.Contains(errb.String(), tc.want) || strings.Contains(errb.String(), "Verifying") {
+			t.Fatalf("%v: exit %d, stderr %q", tc.args, code, errb)
+		}
+	}
+}
+
+func TestBundleLoadToDockerWithPlatform(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	path := bundletest.Build(t, bundletest.Options{Images: []bundletest.Image{
+		{Index: bundletest.PlatformIndex(t, "linux/arm64")},
+	}})
+	docker := cliFakeDocker(t, "linux/amd64")
+	ios, out, errb := testIO("", testEnv)
+	if code := execute(ios, []string{"bundle", "load", path, "--docker", "--docker-command", docker, "--platform", "linux/arm64"}); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb)
+	}
+	if !strings.Contains(out.String(), "Loaded registry.breakwaterapp.com/acme/api:2.4.1\n") {
+		t.Fatalf("stdout %q", out)
+	}
+}
+
+func TestBundleLoadToDockerNotesDigestPins(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	pinned := bundletest.Build(t, bundletest.Options{
+		Images: []bundletest.Image{{Image: bundletest.RandomImage(t)}},
+		Files:  []bundletest.File{{Name: "compose.yaml", Data: []byte("services:\n  api:\n    image: registry.breakwaterapp.com/acme/api:2.4.1@sha256:" + strings.Repeat("a", 64) + "\n")}},
+	})
+	plain, _ := loadFixture(t)
+	docker := cliFakeDocker(t, "linux/amd64")
+	const note = "note: the bundle's files pin images by @sha256: digest"
+	for _, tc := range []struct {
+		path  string
+		extra []string
+		want  bool
+	}{
+		{pinned, nil, true},
+		{pinned, []string{"--rewrite-files", filepath.Join(t.TempDir(), "out")}, false},
+		{plain, nil, false},
+	} {
+		ios, _, errb := testIO("", testEnv)
+		args := append([]string{"bundle", "load", tc.path, "--docker", "--docker-command", docker}, tc.extra...)
+		if code := execute(ios, args); code != 0 {
+			t.Fatalf("exit %d: %s", code, errb)
+		}
+		if got := strings.Contains(errb.String(), note); got != tc.want {
+			t.Fatalf("%v: note %v, stderr %q", tc.extra, got, errb)
+		}
+	}
+}
+
+func TestBundleLoadTrustsCAFileForTheTargetRegistry(t *testing.T) {
+	path, _ := loadFixture(t)
+	srv := quietTLSServer(t, quietRegistry())
+	host := strings.TrimPrefix(srv.URL, "https://")
+	ios, _, errb := testIO("", testEnv)
+	if code := execute(ios, []string{"bundle", "load", path, "--registry", host}); code != 1 || !strings.Contains(errb.String(), "certificate") {
+		t.Fatalf("without --ca-file: exit %d: %s", code, errb)
+	}
+	ios, out, errb := testIO("", testEnv)
+	if code := execute(ios, []string{"bundle", "load", path, "--registry", host, "--ca-file", writeCA(t, srv)}); code != 0 {
+		t.Fatalf("with --ca-file: exit %d: %s", code, errb)
+	}
+	if !strings.Contains(out.String(), " -> "+host+"/acme/api:2.4.1@") {
+		t.Fatalf("stdout %q", out)
+	}
+}

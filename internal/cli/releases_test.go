@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/pem"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -107,10 +109,9 @@ func TestReleasesErrors(t *testing.T) {
 }
 
 func TestCAFileIsTrustedForTheAPI(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := quietTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(twoReleases))
 	}))
-	t.Cleanup(srv.Close)
 	ios, _, errb := testIO("", testEnv)
 	if code := execute(ios, []string{"releases", "--host", srv.URL}); code != 1 || !strings.Contains(errb.String(), "certificate") {
 		t.Fatalf("without --ca-file: exit %d: %s", code, errb)
@@ -124,6 +125,17 @@ func TestCAFileIsTrustedForTheAPI(t *testing.T) {
 	if code := execute(ios, []string{"releases", "--host", srv.URL, "--ca-file", ca + ".missing"}); code != 1 || !strings.Contains(errb.String(), "--ca-file") {
 		t.Fatalf("missing --ca-file: exit %d: %s", code, errb)
 	}
+}
+
+// quietTLSServer is an HTTPS test server that doesn't log the handshake
+// errors of clients that don't trust it.
+func quietTLSServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(h)
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 // writeCA writes a TLS test server's certificate as a PEM file.

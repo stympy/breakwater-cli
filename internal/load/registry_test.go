@@ -149,7 +149,7 @@ func TestToRegistryFullIndexKeepsItsDigest(t *testing.T) {
 	}})
 
 	var out bytes.Buffer
-	ms, err := ToRegistry(context.Background(), b, host, nil, true, &out)
+	ms, err := ToRegistry(context.Background(), b, host, nil, true, nil, &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestToRegistryOneFilteredChildGoesUnderTheTag(t *testing.T) {
 		Images:    []bundletest.Image{{Index: index, Children: children[:1]}},
 	})
 	var out bytes.Buffer
-	ms, err := ToRegistry(context.Background(), b, host, nil, true, &out)
+	ms, err := ToRegistry(context.Background(), b, host, nil, true, nil, &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestToRegistryTwoFilteredChildrenGetANewIndex(t *testing.T) {
 		Platforms: []string{"linux/amd64", "linux/arm64"},
 		Images:    []bundletest.Image{{Index: index, Children: children[:2]}},
 	})
-	ms, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard)
+	ms, err := ToRegistry(context.Background(), b, host, nil, true, nil, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestToRegistryPushesAnArtifactIntact(t *testing.T) {
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{
 		{Reference: "registry.breakwaterapp.com/acme/zarf-package:2.4.1", Image: a},
 	}})
-	if _, err := ToRegistry(context.Background(), b, host+"/mirror", nil, true, io.Discard); err != nil {
+	if _, err := ToRegistry(context.Background(), b, host+"/mirror", nil, true, nil, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	desc, err := remote.Get(ref(t, host+"/mirror/acme/zarf-package:2.4.1"))
@@ -320,7 +320,7 @@ func TestToRegistryKeepsAttestationsOfAFullIndex(t *testing.T) {
 		}},
 	)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Index: index}}})
-	if _, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard); err != nil {
+	if _, err := ToRegistry(context.Background(), b, host, nil, true, nil, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	pushed, err := remote.Index(ref(t, host+"/acme/api:2.4.1"))
@@ -344,7 +344,7 @@ func TestToRegistryFailsWhenABlobChangesAfterOpen(t *testing.T) {
 	p, _ := bundle.BlobPath(ld.String())
 	bundletest.FlipByte(t, path, p)
 
-	_, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard)
+	_, err := ToRegistry(context.Background(), b, host, nil, true, nil, io.Discard)
 	if err == nil {
 		t.Fatal("pushed a changed blob")
 	}
@@ -359,7 +359,7 @@ func TestToRegistryFailsWhenABlobChangesAfterOpen(t *testing.T) {
 func TestToRegistryRefusesPlainHTTPWithoutInsecure(t *testing.T) {
 	host, n := testRegistry(t)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Image: bundletest.RandomImage(t)}}})
-	_, err := ToRegistry(context.Background(), b, host, nil, false, io.Discard)
+	_, err := ToRegistry(context.Background(), b, host, nil, false, nil, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "refusing plain HTTP to registry "+host) || !strings.Contains(err.Error(), "--insecure") {
 		t.Fatalf("err = %v", err)
 	}
@@ -374,7 +374,7 @@ func TestToRegistryRefusesBadTargets(t *testing.T) {
 	// bundle.Open refuses it.)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Image: bundletest.RandomImage(t)}}})
 	for _, bad := range []string{"", "https://" + host, host + "/", host + "/UPPER", host + ":tag"} {
-		if _, err := ToRegistry(context.Background(), b, bad, nil, true, io.Discard); err == nil {
+		if _, err := ToRegistry(context.Background(), b, bad, nil, true, nil, io.Discard); err == nil {
 			t.Fatalf("registry %q accepted", bad)
 		}
 	}
@@ -389,7 +389,7 @@ func TestToRegistryRefusesTwoImagesUnderOneName(t *testing.T) {
 		{Kind: "external", Reference: "redis:7", Image: bundletest.RandomImage(t)},
 		{Kind: "external", Reference: "docker.io/library/redis:7", Image: bundletest.RandomImage(t)},
 	}})
-	_, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard)
+	_, err := ToRegistry(context.Background(), b, host, nil, true, nil, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "both") {
 		t.Fatalf("err = %v", err)
 	}
@@ -404,7 +404,7 @@ func TestToRegistryExternalImageOnAPort(t *testing.T) {
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{
 		{Kind: "external", Reference: "localhost:6000/x:1", Image: img},
 	}})
-	ms, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard)
+	ms, err := ToRegistry(context.Background(), b, host, nil, true, nil, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,6 +24,7 @@ type loadOptions struct {
 	rewriteDir string
 	insecure   bool
 	dockerCmd  string
+	platform   string
 }
 
 func newBundleLoadCommand(g *globals) *cobra.Command {
@@ -38,8 +42,15 @@ external ones to <registry>/<original registry>/<repository>:<tag>, such as
 give the registry's credentials; without them, Docker's credential store is
 used, or none.
 
+With --docker, each image is loaded for Docker's platform, or for
+--platform os/arch[/variant]. --username and --password-stdin don't apply.
+
 --rewrite-files <dir> writes the release's compose and YAML files to <dir>
-with their image: lines pointing at the loaded or pushed images.`,
+with their image: lines pointing at the loaded or pushed images. Files that
+pin images by @sha256: digest need it with --docker, since docker load
+doesn't record registry digests.
+
+--ca-file adds trusted CA certificates for the --registry host.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if o.docker == cmd.Flags().Changed("registry") {
@@ -49,6 +60,12 @@ with their image: lines pointing at the loaded or pushed images.`,
 			if o.insecure && o.docker {
 				return errors.New("--insecure only applies to --registry")
 			}
+			if o.platform != "" && !o.docker {
+				return errors.New("--platform only applies to --docker")
+			}
+			if o.docker && (g.username != "" || g.passwordStdin) {
+				return errors.New("--username and --password-stdin only apply to --registry; loading into Docker needs no credentials")
+			}
 			return runBundleLoad(cmd, g, args[0], o)
 		},
 	}
@@ -57,6 +74,7 @@ with their image: lines pointing at the loaded or pushed images.`,
 	f.StringVar(&o.registry, "registry", "", "push the images to this registry (host[/prefix])")
 	f.StringVar(&o.rewriteDir, "rewrite-files", "", "write the release's compose and YAML files, pointing at the loaded images, to this directory")
 	f.BoolVar(&o.insecure, "insecure", false, "allow plain HTTP to the --registry host")
+	f.StringVar(&o.platform, "platform", "", "with --docker, load images for this platform (os/arch[/variant]) instead of Docker's")
 	f.StringVar(&o.dockerCmd, "docker-command", "docker", "the docker command (testing)")
 	_ = f.MarkHidden("docker-command")
 	return cmd
@@ -69,11 +87,18 @@ func runBundleLoad(cmd *cobra.Command, g *globals, path string, o loadOptions) e
 
 	// Check the target before the (slow) verification.
 	var auth authn.Authenticator
+	var tr *http.Transport
+	if o.docker && o.platform != "" && !bundle.ValidPlatform(o.platform) {
+		return fmt.Errorf("invalid platform %q: use os/arch or os/arch/variant, like linux/amd64 or linux/arm/v7", o.platform)
+	}
 	if !o.docker {
 		if err := load.CheckRegistry(o.registry); err != nil {
 			return err
 		}
 		var err error
+		if tr, err = g.Transport(); err != nil {
+			return err
+		}
 		if auth, err = registryAuth(cmd, g, o.registry); err != nil {
 			return err
 		}
@@ -97,16 +122,19 @@ func runBundleLoad(cmd *cobra.Command, g *globals, path string, o loadOptions) e
 	if o.docker {
 		fmt.Fprintln(stderr, "Loading the images into Docker")
 		var skipped []load.Skipped
-		mappings, skipped, err = load.ToDocker(ctx, b, o.dockerCmd, stdout)
+		mappings, skipped, err = load.ToDocker(ctx, b, o.dockerCmd, o.platform, stdout)
 		if err != nil {
 			return err
 		}
 		if len(mappings) == 0 {
 			fmt.Fprintf(stderr, "warning: nothing was loaded; Docker can't run any of the bundle's %s (push them to a registry with --registry instead)\n", plural(len(skipped), "image"))
 		}
+		if o.rewriteDir == "" && pinsDigests(b) {
+			fmt.Fprintln(stderr, "note: the bundle's files pin images by @sha256: digest, which docker load doesn't record; pass --rewrite-files <dir> for copies that use the loaded names")
+		}
 	} else {
 		fmt.Fprintf(stderr, "Pushing the images to %s\n", o.registry)
-		mappings, err = load.ToRegistry(ctx, b, o.registry, auth, o.insecure, stdout)
+		mappings, err = load.ToRegistry(ctx, b, o.registry, auth, o.insecure, tr, stdout)
 		if err != nil {
 			return err
 		}
@@ -125,6 +153,23 @@ func runBundleLoad(cmd *cobra.Command, g *globals, path string, o loadOptions) e
 		}
 	}
 	return nil
+}
+
+// pinsDigests reports whether any of the bundle's files mentions
+// "@sha256:", as an image reference pinned by digest does.
+func pinsDigests(b *bundle.Bundle) bool {
+	for _, f := range b.Header().Files {
+		rc, err := b.File(f.Name)
+		if err != nil {
+			continue
+		}
+		data, _ := io.ReadAll(io.LimitReader(rc, 4<<20))
+		rc.Close()
+		if bytes.Contains(data, []byte("@sha256:")) {
+			return true
+		}
+	}
+	return false
 }
 
 // registryAuth is the target registry's credentials: --username with

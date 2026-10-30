@@ -102,7 +102,7 @@ func TestToDocker(t *testing.T) {
 	}})
 
 	var out bytes.Buffer
-	ms, skipped, err := ToDocker(context.Background(), b, cmd, &out)
+	ms, skipped, err := ToDocker(context.Background(), b, cmd, "", &out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestToDockerArm64PrefersV8(t *testing.T) {
 		mutate.IndexAddendum{Add: v8, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}}},
 	)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Index: index}}})
-	ms, _, err := ToDocker(context.Background(), b, cmd, &bytes.Buffer{})
+	ms, _, err := ToDocker(context.Background(), b, cmd, "", &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +210,11 @@ func TestPickChild(t *testing.T) {
 		{"linux/amd64", []v1.Descriptor{d("linux/amd64/v3", false), d("linux/amd64", false)}, "linux/amd64"},
 		{"linux/amd64", []v1.Descriptor{d("linux/amd64", true)}, ""},
 		{"windows/amd64", []v1.Descriptor{d("linux/amd64", false)}, ""},
+		// --platform with a variant: it must match.
+		{"linux/arm/v7", []v1.Descriptor{d("linux/arm/v6", false), d("linux/arm/v7", false)}, "linux/arm/v7"},
+		{"linux/arm/v7", []v1.Descriptor{d("linux/arm/v6", false)}, ""},
+		{"linux/arm64/v8", []v1.Descriptor{d("linux/arm64/v9", false), d("linux/arm64", false)}, "linux/arm64"},
+		{"linux/arm64/v9", []v1.Descriptor{d("linux/arm64/v8", false)}, ""},
 	} {
 		got, ok := pickChild(tc.children, tc.host)
 		if gotP := bundle.PlatformString(got.Platform); (ok && gotP != tc.want) || (!ok && tc.want != "") {
@@ -218,12 +223,57 @@ func TestPickChild(t *testing.T) {
 	}
 }
 
+func TestToDockerDescendsIntoNestedIndexes(t *testing.T) {
+	cmd, saved := fakeDocker(t, "linux/arm64", 0)
+	arm := bundletest.RandomImage(t)
+	inner := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{Add: bundletest.RandomImage(t), Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}},
+		mutate.IndexAddendum{Add: arm, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}}},
+	)
+	outer := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{Add: inner})
+	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Index: outer}}})
+	ms, skipped, err := ToDocker(context.Background(), b, cmd, "", &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 1 || len(skipped) != 0 || ms[0].ToDigest != digestOf(t, arm).String() {
+		t.Fatalf("mappings %+v, skipped %+v", ms, skipped)
+	}
+	if _, err := os.Stat(saved); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestToDockerPlatformOverridesDockers(t *testing.T) {
+	cmd, _ := fakeDocker(t, "linux/amd64", 0)
+	v7 := bundletest.RandomImage(t)
+	index := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{Add: bundletest.RandomImage(t), Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}},
+		mutate.IndexAddendum{Add: bundletest.RandomImage(t), Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm", Variant: "v6"}}},
+		mutate.IndexAddendum{Add: v7, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm", Variant: "v7"}}},
+	)
+	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Index: index}}})
+	ms, _, err := ToDocker(context.Background(), b, cmd, "linux/arm/v7", &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 1 || ms[0].ToDigest != digestOf(t, v7).String() {
+		t.Fatalf("mappings %+v", ms)
+	}
+	if got := dockerCalls(t, cmd); !slices.Equal(got, []string{"load"}) {
+		t.Fatalf("docker calls %q: Docker's platform shouldn't be asked", got)
+	}
+	if _, _, err := ToDocker(context.Background(), b, cmd, "Linux/ARM", &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "invalid platform") {
+		t.Fatalf("bad platform: %v", err)
+	}
+}
+
 func TestToDockerEverythingSkipped(t *testing.T) {
 	cmd, saved := fakeDocker(t, "linux/amd64", 0)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{
 		{Reference: "registry.breakwaterapp.com/acme/zarf-package:2.4.1", Image: artifact(t)},
 	}})
-	ms, skipped, err := ToDocker(context.Background(), b, cmd, &bytes.Buffer{})
+	ms, skipped, err := ToDocker(context.Background(), b, cmd, "", &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +291,7 @@ func TestToDockerEverythingSkipped(t *testing.T) {
 func TestToDockerLoadFailure(t *testing.T) {
 	cmd, _ := fakeDocker(t, "linux/amd64", 1)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Image: bundletest.RandomImage(t)}}})
-	_, _, err := ToDocker(context.Background(), b, cmd, &bytes.Buffer{})
+	_, _, err := ToDocker(context.Background(), b, cmd, "", &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "docker load failed") || !strings.Contains(err.Error(), "load failed: bad archive") {
 		t.Fatalf("err = %v", err)
 	}
@@ -250,11 +300,11 @@ func TestToDockerLoadFailure(t *testing.T) {
 func TestToDockerBadVersionOutput(t *testing.T) {
 	cmd, _ := fakeDocker(t, "\x1b[31mnonsense", 0)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{{Image: bundletest.RandomImage(t)}}})
-	_, _, err := ToDocker(context.Background(), b, cmd, &bytes.Buffer{})
+	_, _, err := ToDocker(context.Background(), b, cmd, "", &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "platform") {
 		t.Fatalf("err = %v", err)
 	}
-	if _, _, err := ToDocker(context.Background(), b, filepath.Join(t.TempDir(), "nope"), &bytes.Buffer{}); err == nil {
+	if _, _, err := ToDocker(context.Background(), b, filepath.Join(t.TempDir(), "nope"), "", &bytes.Buffer{}); err == nil {
 		t.Fatal("a missing docker command worked")
 	}
 }
@@ -267,7 +317,7 @@ func TestToDockerFailsWhenABlobChangesAfterOpen(t *testing.T) {
 	p, _ := bundle.BlobPath(digestOf(t, layers[0]).String())
 	bundletest.FlipByte(t, path, p)
 
-	_, _, err := ToDocker(context.Background(), b, cmd, &bytes.Buffer{})
+	_, _, err := ToDocker(context.Background(), b, cmd, "", &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "changed after it was verified") {
 		t.Fatalf("err = %v", err)
 	}
@@ -279,7 +329,7 @@ func TestToDockerRefusesTwoImagesUnderOneName(t *testing.T) {
 		{Kind: "external", Reference: "redis:7", Image: bundletest.RandomImage(t)},
 		{Kind: "external", Reference: "docker.io/library/redis:7", Image: bundletest.RandomImage(t)},
 	}})
-	_, _, err := ToDocker(context.Background(), b, cmd, &bytes.Buffer{})
+	_, _, err := ToDocker(context.Background(), b, cmd, "", &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "both") {
 		t.Fatalf("err = %v", err)
 	}
@@ -296,7 +346,7 @@ func TestToDockerLoadsTheSameImageOnce(t *testing.T) {
 		{Kind: "external", Reference: "docker.io/library/redis:7", Image: redis},
 	}})
 	var out bytes.Buffer
-	ms, _, err := ToDocker(context.Background(), b, cmd, &out)
+	ms, _, err := ToDocker(context.Background(), b, cmd, "", &out)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -29,19 +29,24 @@ type Skipped struct {
 var dockerPlatformPattern = regexp.MustCompile(`^[a-z0-9_]+/[a-z0-9_]+$`)
 
 // ToDocker loads the bundle's container images into Docker, through
-// dockerCmd ("docker" if empty). Each image is loaded for Docker's own
-// platform, named by its Docker-normalized release reference. Artifacts that
+// dockerCmd ("docker" if empty). Each image is loaded for platform
+// ("os/arch[/variant]"), or Docker's own when platform is "", named by its
+// Docker-normalized release reference. Artifacts that
 // aren't container images, and indexes with no manifest for Docker's
 // platform, are skipped. The images are streamed as one docker-archive into
 // "docker load"; nothing is loaded when nothing is left. Loaded names and
 // skipped images are printed to out.
-func ToDocker(ctx context.Context, b *bundle.Bundle, dockerCmd string, out io.Writer) ([]Mapping, []Skipped, error) {
+func ToDocker(ctx context.Context, b *bundle.Bundle, dockerCmd, platform string, out io.Writer) ([]Mapping, []Skipped, error) {
 	if dockerCmd == "" {
 		dockerCmd = "docker"
 	}
-	platform, err := dockerPlatform(ctx, dockerCmd)
-	if err != nil {
-		return nil, nil, err
+	if platform == "" {
+		var err error
+		if platform, err = dockerPlatform(ctx, dockerCmd); err != nil {
+			return nil, nil, err
+		}
+	} else if !bundle.ValidPlatform(platform) {
+		return nil, nil, fmt.Errorf("invalid platform %q: use os/arch or os/arch/variant, like linux/amd64", platform)
 	}
 
 	var (
@@ -116,7 +121,8 @@ func ToDocker(ctx context.Context, b *bundle.Bundle, dockerCmd string, out io.Wr
 }
 
 // chooseManifest picks an image's manifest for platform: a lone manifest as
-// is, or the index child the bundle keeps for it (ok is false if none).
+// is, or the manifest the bundle keeps for it among the index's children
+// and the children of any index nested in it (ok is false if none).
 func chooseManifest(b *bundle.Bundle, img bundle.Image, platform string) (v1.Descriptor, bool, error) {
 	hash, err := v1.NewHash(img.Digest)
 	if err != nil {
@@ -130,34 +136,55 @@ func chooseManifest(b *bundle.Bundle, img bundle.Image, platform string) (v1.Des
 	if err != nil {
 		return v1.Descriptor{}, false, err
 	}
-	d, ok := pickChild(keptChildren(img, im), platform)
+	var candidates []v1.Descriptor
+	for _, c := range keptChildren(img, im) {
+		if !c.MediaType.IsIndex() {
+			candidates = append(candidates, c)
+			continue
+		}
+		// A kept nested index is kept whole, and its children are manifests.
+		_, nested, err := readIndex(b, c.Digest.String())
+		if err != nil {
+			return v1.Descriptor{}, false, err
+		}
+		candidates = append(candidates, nested.Manifests...)
+	}
+	d, ok := pickChild(candidates, platform)
 	return d, ok, nil
 }
 
-// pickChild picks the image manifest for platform ("os/arch", as Docker
-// reports it) among an index's children, skipping attestations. OS and
-// architecture must match; an arm64 host prefers the v8 variant (or none,
-// which means v8), any other host a child with no variant, and otherwise
-// the first match wins.
+// pickChild picks the image manifest for platform ("os/arch" as Docker
+// reports it, or "os/arch/variant" from --platform) among an index's
+// children, skipping attestations. OS and architecture must match. A
+// requested variant must match too (on arm64, no variant means v8).
+// Otherwise an arm64 host prefers v8, any other host a child with no
+// variant, and failing that the first match wins.
 func pickChild(children []v1.Descriptor, platform string) (v1.Descriptor, bool) {
-	goos, arch, _ := strings.Cut(platform, "/")
-	want := ""
-	if arch == "arm64" {
-		want = "v8"
+	parts := strings.SplitN(platform, "/", 3)
+	goos, arch := parts[0], ""
+	if len(parts) > 1 {
+		arch = parts[1]
 	}
+	want, exact := "", len(parts) == 3
+	if exact {
+		want = parts[2]
+	}
+	variant := func(v string) string {
+		if arch == "arm64" && v == "" {
+			return "v8"
+		}
+		return v
+	}
+	want = variant(want)
 	var first *v1.Descriptor
 	for i, c := range children {
 		if !c.MediaType.IsImage() || bundle.IsAttestation(c) || c.Platform == nil || c.Platform.OS != goos || c.Platform.Architecture != arch {
 			continue
 		}
-		v := c.Platform.Variant
-		if arch == "arm64" && v == "" {
-			v = "v8"
-		}
-		if v == want {
+		if variant(c.Platform.Variant) == want {
 			return c, true
 		}
-		if first == nil {
+		if first == nil && !exact {
 			first = &children[i]
 		}
 	}
