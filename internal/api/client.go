@@ -28,7 +28,28 @@ var (
 	digestPattern   = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 	fileNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 	sha256Pattern   = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	repoPathPattern = regexp.MustCompile(`^[a-z0-9._-]+(/[a-z0-9._-]+)*$`)
 )
+
+// ValidFileName reports whether name is an allowed release file name: one
+// path segment of letters, digits, '.', '_' and '-', not "." or "..".
+func ValidFileName(name string) bool {
+	return fileNamePattern.MatchString(name) && name != "." && name != ".."
+}
+
+// validRepositoryPath reports whether p is lowercase slash-separated
+// segments of [a-z0-9._-], none of them "." or "..".
+func validRepositoryPath(p string) bool {
+	if !repoPathPattern.MatchString(p) {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
 
 // Error is a failed API call.
 type Error struct {
@@ -248,10 +269,13 @@ func ValidateManifest(m *Manifest) error {
 		if img.Kind == "internal" && (img.RepositoryPath == "" || img.Tag == "") {
 			return fmt.Errorf("manifest image %q is internal but has no repository_path or tag", img.Reference)
 		}
+		if img.RepositoryPath != "" && !validRepositoryPath(img.RepositoryPath) {
+			return fmt.Errorf("manifest image %q has an invalid repository_path %q", img.Reference, img.RepositoryPath)
+		}
 	}
 	seen := map[string]bool{}
 	for _, f := range m.Files {
-		if !fileNamePattern.MatchString(f.Name) {
+		if !ValidFileName(f.Name) {
 			return fmt.Errorf("manifest file name %q isn't allowed", f.Name)
 		}
 		if seen[f.Name] {
@@ -292,7 +316,7 @@ func originString(u *url.URL) string {
 // On any error w may hold unverified bytes; callers must discard them.
 // The URL must be on the API origin, since credentials go with the request.
 func (c *Client) DownloadFile(ctx context.Context, f ManifestFile, w io.Writer) error {
-	if !fileNamePattern.MatchString(f.Name) {
+	if !ValidFileName(f.Name) {
 		return fmt.Errorf("file name %q isn't allowed", f.Name)
 	}
 	if !sha256Pattern.MatchString(f.SHA256) {

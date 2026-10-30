@@ -297,3 +297,23 @@ func TestValidPath(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateChecksHeaderFields(t *testing.T) {
+	cases := []struct {
+		edit func(*Header)
+		want string
+	}{
+		{func(h *Header) { h.CreatedAt = "yesterday" }, `bundle.json has an invalid created_at "yesterday"`},
+		{func(h *Header) { h.CLIVersion = "" }, `bundle.json has an invalid cli_version ""`},
+		{func(h *Header) { h.Platforms = []string{} }, "bundle.json lists no platforms (null means all)"},
+		{func(h *Header) { h.Platforms = []string{"linux/amd64/v8/x"} }, `bundle.json lists an invalid platform "linux/amd64/v8/x"`},
+	}
+	for _, c := range cases {
+		h := Header{Format: 1, CLIVersion: "0.1.0", CreatedAt: "2026-10-30T00:00:00Z", Manifest: json.RawMessage(`{"format":1,"images":[],"files":[]}`)}
+		c.edit(&h)
+		_, err := Validate(&h, &Index{byPath: map[string]int{}}, bytes.NewReader(nil))
+		if err == nil || err.Error() != c.want {
+			t.Errorf("err %v; want %q", err, c.want)
+		}
+	}
+}

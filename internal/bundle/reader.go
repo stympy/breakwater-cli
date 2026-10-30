@@ -38,7 +38,9 @@ type Index struct {
 	byPath  map[string]int
 }
 
-// Lookup returns the location of path's data.
+// Lookup returns the location of path's data. The offset is where the entry
+// was during Scan; the bytes there aren't re-verified, so don't read content
+// through it: use Bundle.Blob, File or Bin, which check digests.
 func (x *Index) Lookup(path string) (Location, bool) {
 	i, ok := x.byPath[path]
 	if !ok {
@@ -321,13 +323,16 @@ func (b *Bundle) Bin(name string) (io.ReadCloser, error) {
 // Close closes the bundle file. Readers returned earlier stop working.
 func (b *Bundle) Close() error { return b.f.Close() }
 
-// verifyingReader reads an entry at its offset and checks its SHA-256 when
-// it reaches the end.
+// verifyingReader reads an entry at its offset and checks its SHA-256 as
+// soon as it has read the declared size: the Read that delivers the last
+// byte returns the mismatch error, as does every later Read and Close. A
+// file shorter than declared is an error too, not io.EOF.
 type verifyingReader struct {
-	r    io.Reader
-	h    hash.Hash
-	e    IndexEntry
-	done bool
+	r   io.Reader
+	h   hash.Hash
+	e   IndexEntry
+	n   int64
+	err error
 }
 
 func newVerifyingReader(ra io.ReaderAt, e IndexEntry) *verifyingReader {
@@ -335,18 +340,38 @@ func newVerifyingReader(ra io.ReaderAt, e IndexEntry) *verifyingReader {
 }
 
 func (v *verifyingReader) Read(p []byte) (int, error) {
+	if v.err != nil {
+		return 0, v.err
+	}
 	n, err := v.r.Read(p)
 	v.h.Write(p[:n])
-	if err == io.EOF && !v.done {
-		v.done = true
+	v.n += int64(n)
+	if v.n == v.e.Size {
 		if got := hex.EncodeToString(v.h.Sum(nil)); got != v.e.SHA256 {
-			return n, fmt.Errorf("entry %q doesn't match its digest on a second read (got sha256 %s); the file changed after it was verified", v.e.Path, got)
+			v.err = fmt.Errorf("entry %q doesn't match its digest on a second read (got sha256 %s); the file changed after it was verified", v.e.Path, got)
+		} else {
+			v.err = io.EOF
 		}
+		if n > 0 && v.err == io.EOF {
+			return n, nil
+		}
+		return n, v.err
+	}
+	if err == io.EOF {
+		v.err = fmt.Errorf("entry %q is truncated on a second read; the file changed after it was verified", v.e.Path)
+		return n, v.err
 	}
 	return n, err
 }
 
-func (v *verifyingReader) Close() error { return nil }
+// Close returns the digest mismatch, if the whole entry was read and didn't
+// match.
+func (v *verifyingReader) Close() error {
+	if v.err != nil && v.err != io.EOF {
+		return v.err
+	}
+	return nil
+}
 
 // readSmall reads a whole entry of at most max bytes, re-checking its digest.
 func readSmall(ra io.ReaderAt, e IndexEntry, max int64) ([]byte, error) {

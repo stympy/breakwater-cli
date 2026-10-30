@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stympy/breakwater-cli/internal/api"
+	"github.com/stympy/breakwater-cli/internal/bundle"
 	"github.com/stympy/breakwater-cli/internal/bundle/bundletest"
 )
 
@@ -93,5 +95,33 @@ func TestBundleVerifyNeedsOneArg(t *testing.T) {
 	ios, _, errb := testIO("", nil)
 	if code := execute(ios, []string{"bundle", "verify"}); code != 1 || !strings.Contains(errb.String(), "accepts 1 arg") {
 		t.Fatalf("exit %d: %s", code, errb)
+	}
+}
+
+func TestBundleVerifyStripsControlCharacters(t *testing.T) {
+	_, opts := verifyFixture(t)
+	opts.EditManifest = func(m *api.Manifest) {
+		m.Vendor.Name = "Acme\x1b]0;pwned\x07"
+		m.Product.Name = "API\u202eServer"
+	}
+	path := bundletest.Build(t, opts)
+	ios, out, errb := testIO("", nil)
+	if code := execute(ios, []string{"bundle", "verify", path}); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb)
+	}
+	if !strings.Contains(out.String(), "Vendor:       Acme]0;pwned (acme)\n") || !strings.Contains(out.String(), "Product:      APIServer (api)\n") {
+		t.Fatalf("out %q", out)
+	}
+
+	// Errors are cleaned too.
+	opts.EditManifest = func(m *api.Manifest) { m.Images[0].Reference = "registry.breakwaterapp.com/acme/\x1b[2Japi:2.4.1" }
+	opts.EditHeader = func(h *bundle.Header) { h.Images[0].Tag = "evil" }
+	path = bundletest.Build(t, opts)
+	ios, _, errb = testIO("", nil)
+	if code := execute(ios, []string{"bundle", "verify", path}); code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if strings.ContainsRune(errb.String(), 0x1b) || !strings.Contains(errb.String(), "acme/[2Japi:2.4.1") {
+		t.Fatalf("stderr %q", errb)
 	}
 }

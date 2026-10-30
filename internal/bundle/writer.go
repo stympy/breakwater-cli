@@ -51,6 +51,12 @@ func (w *Writer) Begin() error {
 		return w.fail(errors.New("Begin called twice"))
 	}
 	w.began = true
+	if w.header.Format != Format {
+		return w.fail(fmt.Errorf("this writer writes bundle format %d, not %d", Format, w.header.Format))
+	}
+	if w.header.Platforms != nil && len(w.header.Platforms) == 0 {
+		return w.fail(errors.New("platforms is empty; use nil for all platforms"))
+	}
 	mtime, err := time.Parse(time.RFC3339, w.header.CreatedAt)
 	if err != nil {
 		return w.fail(fmt.Errorf("invalid created_at %q: %w", w.header.CreatedAt, err))

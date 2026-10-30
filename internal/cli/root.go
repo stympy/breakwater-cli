@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/stympy/breakwater-cli/internal/credentials"
@@ -110,8 +111,22 @@ func execute(ios *IOStreams, args []string) int {
 	root := newRootCommand(ios)
 	root.SetArgs(args)
 	if err := root.Execute(); err != nil {
-		fmt.Fprintf(ios.Err, "breakwater: %s\n", strings.TrimSpace(err.Error()))
+		fmt.Fprintf(ios.Err, "breakwater: %s\n", cleanMessage(strings.TrimSpace(err.Error())))
 		return 1
 	}
 	return 0
+}
+
+// cleanMessage drops control and format characters other than newline and
+// tab from an error message, since errors can quote hostile input.
+func cleanMessage(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
 }

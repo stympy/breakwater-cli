@@ -5,12 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/stympy/breakwater-cli/internal/api"
+)
+
+var (
+	platformPattern   = regexp.MustCompile(`^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?$`)
+	cliVersionPattern = regexp.MustCompile(`^[A-Za-z0-9.+-]{1,32}$`)
 )
 
 const (
@@ -47,18 +54,30 @@ func IndexAnnotations(reference string) map[string]string {
 // the bundle at the offsets in idx; small blobs it reads are re-checked
 // against their digests.
 func Validate(h *Header, idx *Index, ra io.ReaderAt) (*Summary, error) {
-	v := &validator{h: h, idx: idx, ra: ra, used: make(map[string]bool, len(idx.Entries))}
+	v := &validator{
+		h: h, idx: idx, ra: ra,
+		used:    make(map[string]bool, len(idx.Entries)),
+		walks:   map[walkKey][]IndexEntry{},
+		indexes: map[v1.Hash]*v1.IndexManifest{},
+	}
 	return v.run()
 }
 
+// maxDescriptors caps the descriptors Validate walks across all images
+// (top-level images, children, configs and layers, counting repeats).
+var maxDescriptors = 100000
+
 type validator struct {
-	h    *Header
-	idx  *Index
-	ra   io.ReaderAt
-	used map[string]bool
+	h       *Header
+	idx     *Index
+	ra      io.ReaderAt
+	used    map[string]bool
+	walks   map[walkKey][]IndexEntry
+	indexes map[v1.Hash]*v1.IndexManifest
+	walked  int
 }
 
-type imageKey struct{ kind, reference, tag, digest string }
+type imageKey struct{ kind, reference, tag, repositoryPath, digest string }
 
 func describe(reference, tag string) string {
 	if tag != "" && !strings.HasSuffix(reference, ":"+tag) {
@@ -79,9 +98,15 @@ func (v *validator) run() (*Summary, error) {
 		return nil, fmt.Errorf("bundle.json lists no platforms (null means all)")
 	}
 	for _, p := range v.h.Platforms {
-		if _, err := v1.ParsePlatform(p); err != nil || p == "" {
+		if !platformPattern.MatchString(p) {
 			return nil, fmt.Errorf("bundle.json lists an invalid platform %q", p)
 		}
+	}
+	if _, err := time.Parse(time.RFC3339, v.h.CreatedAt); err != nil {
+		return nil, fmt.Errorf("bundle.json has an invalid created_at %q", v.h.CreatedAt)
+	}
+	if !cliVersionPattern.MatchString(v.h.CLIVersion) {
+		return nil, fmt.Errorf("bundle.json has an invalid cli_version %q", v.h.CLIVersion)
 	}
 
 	byKey, err := v.matchImages(&m)
@@ -90,7 +115,7 @@ func (v *validator) run() (*Summary, error) {
 	}
 	sum := &Summary{Manifest: &m}
 	for _, img := range v.h.Images {
-		info, err := v.image(img, byKey[imageKey{img.Kind, img.Reference, img.Tag, img.Digest}])
+		info, err := v.image(img, byKey[imageKey{img.Kind, img.Reference, img.Tag, img.RepositoryPath, img.Digest}])
 		if err != nil {
 			return nil, fmt.Errorf("image %s: %w", describe(img.Reference, img.Tag), err)
 		}
@@ -119,11 +144,11 @@ func (v *validator) matchImages(m *api.Manifest) (map[imageKey]api.ManifestImage
 	byKey := map[imageKey]api.ManifestImage{}
 	inHeader := map[imageKey]int{}
 	for _, img := range v.h.Images {
-		inHeader[imageKey{img.Kind, img.Reference, img.Tag, img.Digest}]++
+		inHeader[imageKey{img.Kind, img.Reference, img.Tag, img.RepositoryPath, img.Digest}]++
 	}
 	inManifest := map[imageKey]int{}
 	for _, mi := range m.Images {
-		k := imageKey{mi.Kind, mi.Reference, mi.Tag, mi.Digest}
+		k := imageKey{mi.Kind, mi.Reference, mi.Tag, mi.RepositoryPath, mi.Digest}
 		byKey[k] = mi
 		inManifest[k]++
 		if inManifest[k] > inHeader[k] {
@@ -131,7 +156,7 @@ func (v *validator) matchImages(m *api.Manifest) (map[imageKey]api.ManifestImage
 		}
 	}
 	for _, img := range v.h.Images {
-		k := imageKey{img.Kind, img.Reference, img.Tag, img.Digest}
+		k := imageKey{img.Kind, img.Reference, img.Tag, img.RepositoryPath, img.Digest}
 		if inHeader[k] > inManifest[k] {
 			return nil, fmt.Errorf("image %s is in bundle.json but not in the manifest", describe(img.Reference, img.Tag))
 		}
@@ -175,11 +200,22 @@ type sizer struct {
 	total int64
 }
 
-func (s *sizer) add(e IndexEntry) {
-	if !s.seen[e.Path] {
-		s.seen[e.Path] = true
-		s.total += e.Size
+func (s *sizer) add(es ...IndexEntry) {
+	for _, e := range es {
+		if !s.seen[e.Path] {
+			s.seen[e.Path] = true
+			s.total += e.Size
+		}
 	}
+}
+
+// count charges one descriptor against the walk budget.
+func (v *validator) count() error {
+	v.walked++
+	if v.walked > maxDescriptors {
+		return fmt.Errorf("the bundle's images have more than %d descriptors", maxDescriptors)
+	}
+	return nil
 }
 
 func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
@@ -199,6 +235,9 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 		}
 	default:
 		return info, fmt.Errorf("unsupported media type %s", mt)
+	}
+	if err := v.count(); err != nil {
+		return info, err
 	}
 	hash, err := v1.NewHash(img.Digest)
 	if err != nil {
@@ -222,9 +261,11 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 
 	if mt.IsImage() {
 		info.Platforms = 1
-		if err := v.manifest(top, e, sz); err != nil {
+		blobs, err := v.walk("manifest", top, false)
+		if err != nil {
 			return info, err
 		}
+		sz.add(blobs...)
 		info.Size = sz.total
 		return info, nil
 	}
@@ -233,7 +274,7 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 	if err != nil {
 		return info, err
 	}
-	descs := map[v1.Hash]v1.Descriptor{}
+	descs := make(map[v1.Hash]v1.Descriptor, len(im.Manifests))
 	for _, d := range im.Manifests {
 		descs[d.Digest] = d
 	}
@@ -251,9 +292,20 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 		if !ok {
 			return info, fmt.Errorf("child %s isn't in its index", c)
 		}
-		if err := v.child(d, true, sz); err != nil {
+		if !isAttestation(d) && v.h.Platforms != nil {
+			p := platformString(d.Platform)
+			if !slices.Contains(v.h.Platforms, p) {
+				if p == "" {
+					p = "no platform"
+				}
+				return info, fmt.Errorf("child %s is for %s, which isn't one of the bundle's platforms", c, p)
+			}
+		}
+		blobs, err := v.walk(childWhat(d), d, true)
+		if err != nil {
 			return info, err
 		}
+		sz.add(blobs...)
 		if !isAttestation(d) {
 			info.Platforms++
 		}
@@ -265,6 +317,25 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 	return info, nil
 }
 
+func childWhat(d v1.Descriptor) string {
+	if d.MediaType.IsIndex() {
+		return "index"
+	}
+	return "manifest"
+}
+
+// platformString is "os/arch[/variant]", or "" for no platform.
+func platformString(p *v1.Platform) string {
+	if p == nil {
+		return ""
+	}
+	s := p.OS + "/" + p.Architecture
+	if p.Variant != "" {
+		s += "/" + p.Variant
+	}
+	return s
+}
+
 func isAttestation(d v1.Descriptor) bool {
 	if d.Annotations[referenceTypeAnnotation] == "attestation-manifest" {
 		return true
@@ -272,41 +343,68 @@ func isAttestation(d v1.Descriptor) bool {
 	return d.Platform != nil && d.Platform.OS == "unknown" && d.Platform.Architecture == "unknown"
 }
 
-// child validates an index's child manifest; nestedOK allows it to be an
-// index itself, whose children are then all required.
-func (v *validator) child(d v1.Descriptor, nestedOK bool, sz *sizer) error {
-	switch {
-	case d.MediaType.IsImage():
-		e, err := v.blob("manifest", d)
-		if err != nil {
-			return err
-		}
-		sz.add(e)
-		return v.manifest(d, e, sz)
-	case d.MediaType.IsIndex() && nestedOK:
-		e, err := v.blob("index", d)
-		if err != nil {
-			return err
-		}
-		sz.add(e)
-		im, err := v.index(d, e)
-		if err != nil {
-			return err
-		}
-		for _, c := range im.Manifests {
-			if err := v.child(c, false, sz); err != nil {
-				return err
-			}
-		}
-		return nil
-	case d.MediaType.IsIndex():
-		return fmt.Errorf("index %s is nested more than one level deep", d.Digest)
-	default:
-		return fmt.Errorf("child %s has unsupported media type %s", d.Digest, d.MediaType)
-	}
+type walkKey struct {
+	digest   v1.Hash
+	nestedOK bool
 }
 
+// walk validates a descriptor's manifest or index (nestedOK allows an
+// index, whose children are then all required and must be manifests) and
+// returns every blob under it, its own included. Results are memoized by
+// digest, so a hostile bundle can't make Validate re-read the same blobs
+// over and over; every visit still counts against maxDescriptors.
+func (v *validator) walk(what string, d v1.Descriptor, nestedOK bool) ([]IndexEntry, error) {
+	if err := v.count(); err != nil {
+		return nil, err
+	}
+	key := walkKey{d.Digest, nestedOK}
+	if blobs, ok := v.walks[key]; ok {
+		return blobs, nil
+	}
+	var blobs []IndexEntry
+	switch {
+	case d.MediaType.IsImage():
+		e, err := v.blob(what, d)
+		if err != nil {
+			return nil, err
+		}
+		under, err := v.manifest(d, e)
+		if err != nil {
+			return nil, err
+		}
+		blobs = append([]IndexEntry{e}, under...)
+	case d.MediaType.IsIndex() && nestedOK:
+		e, err := v.blob(what, d)
+		if err != nil {
+			return nil, err
+		}
+		im, err := v.index(d, e)
+		if err != nil {
+			return nil, err
+		}
+		blobs = []IndexEntry{e}
+		for _, c := range im.Manifests {
+			under, err := v.walk(childWhat(c), c, false)
+			if err != nil {
+				return nil, err
+			}
+			blobs = append(blobs, under...)
+		}
+	case d.MediaType.IsIndex():
+		return nil, fmt.Errorf("index %s is nested more than one level deep", d.Digest)
+	default:
+		return nil, fmt.Errorf("child %s has unsupported media type %s", d.Digest, d.MediaType)
+	}
+	v.walks[key] = blobs
+	return blobs, nil
+}
+
+// index reads and parses an index blob, memoized by digest. An index that
+// lists a digest twice is refused.
 func (v *validator) index(d v1.Descriptor, e IndexEntry) (*v1.IndexManifest, error) {
+	if im, ok := v.indexes[d.Digest]; ok {
+		return im, nil
+	}
 	raw, err := readSmall(v.ra, e, MaxManifestSize)
 	if err != nil {
 		return nil, err
@@ -318,34 +416,49 @@ func (v *validator) index(d v1.Descriptor, e IndexEntry) (*v1.IndexManifest, err
 	if im.MediaType != "" && im.MediaType != d.MediaType {
 		return nil, fmt.Errorf("index %s says media type %s, but its descriptor says %s", d.Digest, im.MediaType, d.MediaType)
 	}
+	seen := make(map[v1.Hash]bool, len(im.Manifests))
+	for _, c := range im.Manifests {
+		if seen[c.Digest] {
+			return nil, fmt.Errorf("index %s lists %s twice", d.Digest, c.Digest)
+		}
+		seen[c.Digest] = true
+	}
+	v.indexes[d.Digest] = im
 	return im, nil
 }
 
-func (v *validator) manifest(d v1.Descriptor, e IndexEntry, sz *sizer) error {
+// manifest checks a manifest's config and layers, returning their blobs.
+func (v *validator) manifest(d v1.Descriptor, e IndexEntry) ([]IndexEntry, error) {
 	raw, err := readSmall(v.ra, e, MaxManifestSize)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	m, err := v1.ParseManifest(bytes.NewReader(raw))
 	if err != nil {
-		return fmt.Errorf("manifest %s doesn't parse: %w", d.Digest, err)
+		return nil, fmt.Errorf("manifest %s doesn't parse: %w", d.Digest, err)
 	}
 	if m.MediaType != "" && m.MediaType != d.MediaType {
-		return fmt.Errorf("manifest %s says media type %s, but its descriptor says %s", d.Digest, m.MediaType, d.MediaType)
+		return nil, fmt.Errorf("manifest %s says media type %s, but its descriptor says %s", d.Digest, m.MediaType, d.MediaType)
+	}
+	if err := v.count(); err != nil {
+		return nil, err
 	}
 	ce, err := v.blob("config", m.Config)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	sz.add(ce)
+	blobs := []IndexEntry{ce}
 	for _, l := range m.Layers {
+		if err := v.count(); err != nil {
+			return nil, err
+		}
 		le, err := v.blob("layer", l)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		sz.add(le)
+		blobs = append(blobs, le)
 	}
-	return nil
+	return blobs, nil
 }
 
 func (v *validator) files(m *api.Manifest) error {
@@ -388,8 +501,11 @@ func (v *validator) files(m *api.Manifest) error {
 func (v *validator) bins() error {
 	seen := map[string]bool{}
 	for _, b := range v.h.Bin {
-		if !validName(b.Name) {
+		if !api.ValidFileName(b.Name) {
 			return fmt.Errorf("binary %q has an unsafe name", b.Name)
+		}
+		if !platformPattern.MatchString(b.Platform) {
+			return fmt.Errorf("binary %s has an invalid platform %q", b.Name, b.Platform)
 		}
 		if seen[b.Name] {
 			return fmt.Errorf("bundle.json lists binary %s twice", b.Name)
@@ -442,10 +558,14 @@ func (v *validator) layout(byKey map[imageKey]api.ManifestImage) error {
 	}
 	var got, want []row
 	for _, d := range im.Manifests {
-		got = append(got, row{d.Digest.String(), string(d.MediaType), d.Annotations[refNameAnnotation], d.Size})
+		name := d.Annotations[refNameAnnotation]
+		if len(d.Annotations) != 2 || name == "" || d.Annotations[containerdNameAnnotation] != name {
+			return fmt.Errorf("%s: the entry for %s must have exactly the annotations %s and %s, both its reference", IndexPath, d.Digest, refNameAnnotation, containerdNameAnnotation)
+		}
+		got = append(got, row{d.Digest.String(), string(d.MediaType), name, d.Size})
 	}
 	for _, img := range v.h.Images {
-		mi := byKey[imageKey{img.Kind, img.Reference, img.Tag, img.Digest}]
+		mi := byKey[imageKey{img.Kind, img.Reference, img.Tag, img.RepositoryPath, img.Digest}]
 		want = append(want, row{img.Digest, img.MediaType, img.Reference, mi.Size})
 	}
 	cmp := func(a, b row) int { return strings.Compare(a.digest+" "+a.name, b.digest+" "+b.name) }

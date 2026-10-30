@@ -146,6 +146,16 @@ func TestWriterRefusesBadDeclarations(t *testing.T) {
 		t.Errorf("err %v", err)
 	}
 	h := header()
+	h.Format = 2
+	if err := bundle.NewWriter(io.Discard, h).Begin(); err == nil || !strings.Contains(err.Error(), "format 1, not 2") {
+		t.Errorf("err %v", err)
+	}
+	h = header()
+	h.Platforms = []string{}
+	if err := bundle.NewWriter(io.Discard, h).Begin(); err == nil || !strings.Contains(err.Error(), "use nil for all platforms") {
+		t.Errorf("err %v", err)
+	}
+	h = header()
 	h.CreatedAt = "yesterday"
 	if err := bundle.NewWriter(io.Discard, h).Begin(); err == nil || !strings.Contains(err.Error(), "created_at") {
 		t.Errorf("err %v", err)

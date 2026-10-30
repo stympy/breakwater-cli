@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/stympy/breakwater-cli/internal/bundle"
@@ -46,13 +47,13 @@ func printBundleSummary(g *globals, b *bundle.Bundle) {
 	out := g.io.Out
 	platforms := "all"
 	if h.Platforms != nil {
-		platforms = strings.Join(h.Platforms, ", ")
+		platforms = clean(strings.Join(h.Platforms, ", "))
 	}
-	fmt.Fprintf(out, "Vendor:       %s (%s)\n", m.Vendor.Name, m.Vendor.Slug)
-	fmt.Fprintf(out, "Product:      %s (%s)\n", m.Product.Name, m.Product.Slug)
-	fmt.Fprintf(out, "Version:      %s\n", m.Version)
-	fmt.Fprintf(out, "Created:      %s\n", h.CreatedAt)
-	fmt.Fprintf(out, "CLI version:  %s\n", h.CLIVersion)
+	fmt.Fprintf(out, "Vendor:       %s (%s)\n", clean(m.Vendor.Name), clean(m.Vendor.Slug))
+	fmt.Fprintf(out, "Product:      %s (%s)\n", clean(m.Product.Name), clean(m.Product.Slug))
+	fmt.Fprintf(out, "Version:      %s\n", clean(m.Version))
+	fmt.Fprintf(out, "Created:      %s\n", clean(h.CreatedAt))
+	fmt.Fprintf(out, "CLI version:  %s\n", clean(h.CLIVersion))
 	fmt.Fprintf(out, "Platforms:    %s\n", platforms)
 
 	fmt.Fprintf(out, "\nImages (%d):\n", len(b.Images()))
@@ -62,25 +63,36 @@ func printBundleSummary(g *globals, b *bundle.Bundle) {
 		if img.Platforms == 1 {
 			noun = "platform"
 		}
-		fmt.Fprintf(tw, "  %s@%s\t%d %s\t%s\n", img.Reference, shortDigest(img.Digest), img.Platforms, noun, humanSize(img.Size))
+		fmt.Fprintf(tw, "  %s@%s\t%d %s\t%s\n", clean(img.Reference), clean(shortDigest(img.Digest)), img.Platforms, noun, humanSize(img.Size))
 	}
 	tw.Flush()
 
 	fmt.Fprintf(out, "\nFiles (%d):\n", len(h.Files))
 	tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	for _, f := range h.Files {
-		fmt.Fprintf(tw, "  %s\t%s\n", f.Name, humanSize(f.Size))
+		fmt.Fprintf(tw, "  %s\t%s\n", clean(f.Name), humanSize(f.Size))
 	}
 	tw.Flush()
 
 	fmt.Fprintf(out, "\nBinaries (%d):\n", len(h.Bin))
 	tw = tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	for _, x := range h.Bin {
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", x.Name, x.Platform, humanSize(x.Size))
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", clean(x.Name), clean(x.Platform), humanSize(x.Size))
 	}
 	tw.Flush()
 
 	fmt.Fprintln(out, "\nOK: every image, file and binary matches its digest.")
+}
+
+// clean drops control and format characters (escape sequences, bidi
+// overrides) from bundle-supplied text before it reaches a terminal.
+func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // shortDigest is "sha256:" and the first 12 hex characters.

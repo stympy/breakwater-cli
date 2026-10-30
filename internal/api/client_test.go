@@ -176,6 +176,13 @@ func TestManifestRefusals(t *testing.T) {
 		{"file upper sha", mod(func(m map[string]any) { m["files"] = []any{file("a", 1, strings.ToUpper(sha))} }), "invalid sha256"},
 		{"file short sha", mod(func(m map[string]any) { m["files"] = []any{file("a", 1, "abc")} }), "invalid sha256"},
 		{"file negative size", mod(func(m map[string]any) { m["files"] = []any{file("a", -1, sha)} }), "invalid size"},
+		{"file dot", mod(func(m map[string]any) { m["files"] = []any{file(".", 1, sha)} }), "isn't allowed"},
+		{"file dotdot", mod(func(m map[string]any) { m["files"] = []any{file("..", 1, sha)} }), "isn't allowed"},
+		{"repo path dotdot", mod(func(m map[string]any) { img(m)["repository_path"] = "v/../app" }), "invalid repository_path"},
+		{"repo path leading slash", mod(func(m map[string]any) { img(m)["repository_path"] = "/v/app" }), "invalid repository_path"},
+		{"repo path empty segment", mod(func(m map[string]any) { img(m)["repository_path"] = "v//app" }), "invalid repository_path"},
+		{"repo path uppercase", mod(func(m map[string]any) { img(m)["repository_path"] = "v/App" }), "invalid repository_path"},
+		{"repo path control char", mod(func(m map[string]any) { img(m)["repository_path"] = "v/a\x1bpp" }), "invalid repository_path"},
 		{"internal no tag", mod(func(m map[string]any) { img(m)["tag"] = "" }), "no repository_path or tag"},
 	}
 	for _, tc := range cases {

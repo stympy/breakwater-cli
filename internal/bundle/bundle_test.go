@@ -2,12 +2,15 @@ package bundle_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/stympy/breakwater-cli/internal/api"
 	"github.com/stympy/breakwater-cli/internal/bundle"
 	"github.com/stympy/breakwater-cli/internal/bundle/bundletest"
@@ -16,9 +19,10 @@ import (
 // fixture is one single-manifest image, one 2-platform index, one file and
 // one binary.
 type fixture struct {
-	img   v1.Image
-	index v1.ImageIndex
-	opts  bundletest.Options
+	img     v1.Image
+	index   v1.ImageIndex
+	opts    bundletest.Options
+	restore func() // set by an edit that changes package state
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -234,9 +238,44 @@ func TestValidateFailures(t *testing.T) {
 		{"manifest invalid", func(f *fixture) {
 			f.opts.EditManifest = func(m *api.Manifest) { m.Images[0].Kind = "weird" }
 		}, `bundle.json's manifest: manifest image 1 has unknown kind "weird"`},
-		{"empty platforms list", func(f *fixture) {
-			f.opts.Platforms = []string{}
-		}, "bundle.json lists no platforms (null means all)"},
+		{"child outside the platforms", func(f *fixture) {
+			im, _ := f.index.IndexManifest()
+			f.opts.Platforms = []string{"linux/amd64"}
+			f.opts.Images[1].Children = []v1.Hash{im.Manifests[1].Digest}
+		}, "image docker.io/library/redis:7: child sha256:"},
+		{"repository_path differs", func(f *fixture) {
+			f.opts.EditManifest = func(m *api.Manifest) { m.Images[0].RepositoryPath = "acme/other" }
+		}, "image registry.breakwaterapp.com/acme/api:2.4.1 is in the manifest but not in bundle.json"},
+		{"index.json extra annotation", func(f *fixture) {
+			f.opts.EditIndexJSON = func(im *v1.IndexManifest) { im.Manifests[0].Annotations["x"] = "y" }
+		}, "oci/index.json: the entry for sha256:"},
+		{"index.json containerd name differs", func(f *fixture) {
+			f.opts.EditIndexJSON = func(im *v1.IndexManifest) {
+				im.Manifests[1].Annotations["io.containerd.image.name"] = "docker.io/library/evil:1"
+			}
+		}, "must have exactly the annotations"},
+		{"index.json ref name differs", func(f *fixture) {
+			f.opts.EditIndexJSON = func(im *v1.IndexManifest) {
+				im.Manifests[1].Annotations = bundle.IndexAnnotations("docker.io/library/evil:1")
+			}
+		}, "oci/index.json doesn't list exactly the bundle's images"},
+		{"bin name with an escape", func(f *fixture) {
+			f.opts.EditHeader = func(h *bundle.Header) { h.Bin[0].Name = "x\x1b[31m" }
+		}, `binary "x\x1b[31m" has an unsafe name`},
+		{"bin platform invalid", func(f *fixture) {
+			f.opts.EditHeader = func(h *bundle.Header) { h.Bin[0].Platform = "Linux/AMD64" }
+		}, `binary breakwater_linux_amd64 has an invalid platform "Linux/AMD64"`},
+		{"cli_version invalid", func(f *fixture) {
+			f.opts.EditHeader = func(h *bundle.Header) { h.CLIVersion = "1.0\x1b]0;pwned\x07" }
+		}, `bundle.json has an invalid cli_version`},
+		{"nested index lists a child twice", func(f *fixture) {
+			img := bundletest.RandomImage(t)
+			inner := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{Add: img}, mutate.IndexAddendum{Add: img})
+			f.opts.Images[1].Index = mutate.AppendManifests(empty.Index, mutate.IndexAddendum{Add: inner})
+		}, "image docker.io/library/redis:7: index sha256:"},
+		{"descriptor budget", func(f *fixture) {
+			f.restore = bundle.SetMaxDescriptors(5)
+		}, "the bundle's images have more than 5 descriptors"},
 		{"index.json disagrees", func(f *fixture) {
 			f.opts.EditIndexJSON = func(im *v1.IndexManifest) { im.Manifests = im.Manifests[:1] }
 		}, "oci/index.json doesn't list exactly the bundle's images"},
@@ -248,6 +287,9 @@ func TestValidateFailures(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t)
 			c.edit(f)
+			if f.restore != nil {
+				defer f.restore()
+			}
 			b, err := bundle.Open(bundletest.Build(t, f.opts))
 			if err == nil {
 				b.Close()
@@ -257,6 +299,84 @@ func TestValidateFailures(t *testing.T) {
 				t.Fatalf("error %q; want it to contain %q", err, c.want)
 			}
 		})
+	}
+}
+
+// TestRepeatedIndexesAreValidatedOnce: many images naming one index, which
+// nests an index, stay within a small descriptor budget because walks are
+// memoized; each visit is still counted.
+func TestRepeatedIndexesAreValidatedOnce(t *testing.T) {
+	inner := bundletest.PlatformIndex(t, "linux/amd64", "linux/arm64")
+	outer := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{Add: inner}, mutate.IndexAddendum{Add: bundletest.RandomImage(t)})
+	var opts bundletest.Options
+	for i := range 50 {
+		opts.Images = append(opts.Images, bundletest.Image{Kind: "external", Reference: fmt.Sprintf("docker.io/library/app%d:1", i), Index: outer})
+	}
+	readFor := func(n int) int64 {
+		o := opts
+		o.Images = opts.Images[:n]
+		f, err := os.Open(bundletest.Build(t, o))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		h, idx, err := bundle.Scan(f, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ra := &countingReaderAt{r: f}
+		if _, err := bundle.Validate(h, idx, ra); err != nil {
+			t.Fatal(err)
+		}
+		return ra.n
+	}
+	one, fifty := readFor(1), readFor(50)
+	// Only oci/index.json grows (about 200 bytes an image); manifests and
+	// indexes are read once.
+	if fifty > one+50*300 {
+		t.Fatalf("Validate read %d bytes for 50 images, %d for 1", fifty, one)
+	}
+	t.Cleanup(bundle.SetMaxDescriptors(100))
+	if _, err := bundle.Open(bundletest.Build(t, opts)); err == nil || !strings.Contains(err.Error(), "more than 100 descriptors") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+type countingReaderAt struct {
+	r io.ReaderAt
+	n int64
+}
+
+func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := c.r.ReadAt(p, off)
+	c.n += int64(n)
+	return n, err
+}
+
+func TestBlobCloseReportsAMismatchAfterAnExactRead(t *testing.T) {
+	f := newFixture(t)
+	path := bundletest.Build(t, f.opts)
+	b, err := bundle.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	layers, _ := f.img.Layers()
+	d, _ := layers[0].Digest()
+	entry := "oci/blobs/sha256/" + d.Hex
+	loc, _ := b.Index().Lookup(entry)
+	bundletest.FlipByte(t, path, entry)
+	rc, err := b.Blob(d.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, loc.Size)
+	io.ReadFull(rc, buf) // ReadFull drops an error that comes with the last byte
+	if _, err := rc.Read(make([]byte, 1)); err == nil || err == io.EOF {
+		t.Fatalf("next Read err %v", err)
+	}
+	if err := rc.Close(); err == nil || !strings.Contains(err.Error(), "doesn't match its digest") {
+		t.Fatalf("Close err %v", err)
 	}
 }
 
