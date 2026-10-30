@@ -21,6 +21,8 @@ Version is set with `-ldflags "-X github.com/stympy/breakwater-cli/internal/vers
 - `internal/api`: customer API client (never follows redirects; file downloads only from the API origin)
 - `internal/credentials`: credential resolution
 - `internal/bundle`: bundle format: `Writer`, streaming `Scan` (the hostile-input checks), `Open`/`Validate`; `bundle/bundletest` builds test bundles from ggcr images for any package's tests
+- `internal/images`: `Collector` resolves release images by digest (platform filtering, credentials only for internal images on `--registry-host`) and streams their blobs
+- `internal/selfdist`: the running binary and `--cli-binaries` downloads from GitHub Releases, checked against `checksums.txt`
 - `internal/version`: version and User-Agent
 
 ## Credential rules

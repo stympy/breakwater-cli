@@ -17,6 +17,7 @@ func newBundleCommand(g *globals) *cobra.Command {
 		Use:   "bundle",
 		Short: "Create, verify and load offline bundles",
 	}
+	cmd.AddCommand(newBundleCreateCommand(g))
 	cmd.AddCommand(newBundleVerifyCommand(g))
 	return cmd
 }

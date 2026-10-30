@@ -292,9 +292,9 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 		if !ok {
 			return info, fmt.Errorf("child %s isn't in its index", c)
 		}
-		if !isAttestation(d) && v.h.Platforms != nil {
-			if !platformWanted(d.Platform, v.h.Platforms) {
-				p := platformString(d.Platform)
+		if !IsAttestation(d) && v.h.Platforms != nil {
+			if !PlatformMatches(d.Platform, v.h.Platforms) {
+				p := PlatformString(d.Platform)
 				if p == "" {
 					p = "no platform"
 				}
@@ -306,7 +306,7 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 			return info, err
 		}
 		sz.add(blobs...)
-		if !isAttestation(d) {
+		if !IsAttestation(d) {
 			info.Platforms++
 		}
 	}
@@ -324,8 +324,8 @@ func childWhat(d v1.Descriptor) string {
 	return "manifest"
 }
 
-// platformString is "os/arch[/variant]", or "" for no platform.
-func platformString(p *v1.Platform) string {
+// PlatformString is "os/arch[/variant]", or "" for no platform.
+func PlatformString(p *v1.Platform) string {
 	if p == nil {
 		return ""
 	}
@@ -336,11 +336,11 @@ func platformString(p *v1.Platform) string {
 	return s
 }
 
-// platformWanted reports whether p matches one of the requested platforms:
+// PlatformMatches reports whether p matches one of the requested platforms:
 // OS and architecture must be equal, and the variant too when the request
 // names one ("linux/arm64" matches linux/arm64/v8; "linux/arm/v7" doesn't
 // match linux/arm/v6).
-func platformWanted(p *v1.Platform, wanted []string) bool {
+func PlatformMatches(p *v1.Platform, wanted []string) bool {
 	if p == nil {
 		return false
 	}
@@ -356,7 +356,9 @@ func platformWanted(p *v1.Platform, wanted []string) bool {
 	return false
 }
 
-func isAttestation(d v1.Descriptor) bool {
+// IsAttestation reports whether an index child is a buildx attestation
+// manifest (by annotation, or the unknown/unknown platform).
+func IsAttestation(d v1.Descriptor) bool {
 	if d.Annotations[referenceTypeAnnotation] == "attestation-manifest" {
 		return true
 	}
@@ -611,3 +613,7 @@ func (v *validator) layout(byKey map[imageKey]api.ManifestImage) error {
 	}
 	return nil
 }
+
+// ValidPlatform reports whether s is "os/arch" or "os/arch/variant" in
+// lowercase letters and digits, as bundle.json and the API require.
+func ValidPlatform(s string) bool { return platformPattern.MatchString(s) }
