@@ -76,6 +76,8 @@ func TestErrorStatusMapping(t *testing.T) {
 		{"403 other", 403, `{"error":"nope"}`, nil, `Breakwater API returned 403: nope`, false},
 		{"404 manifest", 404, `{"error":"Resource not found"}`, nil, `no release 1.0.0 of p that this token can see`, true},
 		{"429", 429, `{}`, map[string]string{"Retry-After": "7"}, `rate limited by Breakwater; try again in 7s`, false},
+		{"429 none", 429, `{}`, nil, `rate limited by Breakwater; try again later`, false},
+		{"429 date", 429, `{}`, map[string]string{"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, `rate limited by Breakwater; try again later`, false},
 		{"500 json", 500, `{"error":"boom"}`, nil, `Breakwater API returned 500: boom`, false},
 		{"500 body", 500, `<html>oops</html>`, nil, `Breakwater API returned 500: <html>oops</html>`, false},
 		{"422 details", 422, `{"error":"Validation failed","details":["platforms bad","x"]}`, nil, `Breakwater API returned 422: Validation failed: platforms bad; x`, false},
@@ -125,9 +127,6 @@ func TestRedirectRefusedAndNotFollowed(t *testing.T) {
 	if hits.Load() != 0 {
 		t.Fatal("redirect target was hit")
 	}
-	// WithHTTPClient can't re-enable redirects.
-	u, _ := url.Parse(other.URL)
-	_ = New(u, creds, WithHTTPClient(&http.Client{}))
 }
 
 func TestWithHTTPClientKeepsRedirectsRefused(t *testing.T) {
@@ -152,6 +151,10 @@ func TestManifestRefusals(t *testing.T) {
 		return m
 	}
 	img := func(m map[string]any) map[string]any { return m["images"].([]any)[0].(map[string]any) }
+	sha := strings.Repeat("b", 64)
+	file := func(name string, size int, sum string) map[string]any {
+		return map[string]any{"name": name, "size": size, "sha256": sum, "url": "http://x/f"}
+	}
 	cases := []struct {
 		name string
 		m    map[string]any
@@ -166,6 +169,13 @@ func TestManifestRefusals(t *testing.T) {
 		{"bad digest", mod(func(m map[string]any) { img(m)["digest"] = "sha256:ABC" }), "invalid digest"},
 		{"bad kind", mod(func(m map[string]any) { img(m)["kind"] = "weird" }), "unknown kind"},
 		{"internal no path", mod(func(m map[string]any) { img(m)["repository_path"] = "" }), "no repository_path or tag"},
+		{"other product", mod(func(m map[string]any) { m["product"] = map[string]any{"name": "X", "slug": "other"} }), `for product "other", not "p"`},
+		{"other version", mod(func(m map[string]any) { m["version"] = "9.9.9" }), `for version "9.9.9", not "1.0.0"`},
+		{"file bad name", mod(func(m map[string]any) { m["files"] = []any{file("../x", 1, sha)} }), "isn't allowed"},
+		{"file dup", mod(func(m map[string]any) { m["files"] = []any{file("a", 1, sha), file("a", 2, sha)} }), "twice"},
+		{"file upper sha", mod(func(m map[string]any) { m["files"] = []any{file("a", 1, strings.ToUpper(sha))} }), "invalid sha256"},
+		{"file short sha", mod(func(m map[string]any) { m["files"] = []any{file("a", 1, "abc")} }), "invalid sha256"},
+		{"file negative size", mod(func(m map[string]any) { m["files"] = []any{file("a", -1, sha)} }), "invalid size"},
 		{"internal no tag", mod(func(m map[string]any) { img(m)["tag"] = "" }), "no repository_path or tag"},
 	}
 	for _, tc := range cases {
@@ -183,7 +193,10 @@ func TestManifestOKAndRawAndPathEscaping(t *testing.T) {
 	var rawPath string
 	c, _ := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rawPath = r.URL.EscapedPath()
-		json.NewEncoder(w).Encode(okManifest())
+		m := okManifest()
+		m["product"] = map[string]any{"name": "P", "slug": "my prod"}
+		m["version"] = "2.4.1+build.5/x"
+		json.NewEncoder(w).Encode(m)
 	}))
 	m, raw, err := c.Manifest(context.Background(), "my prod", "2.4.1+build.5/x")
 	if err != nil {
@@ -192,7 +205,7 @@ func TestManifestOKAndRawAndPathEscaping(t *testing.T) {
 	if rawPath != "/api/v1/customer/products/my%20prod/releases/2.4.1+build.5%2Fx" {
 		t.Fatalf("path %q", rawPath)
 	}
-	if m.Version != "1.0.0" || len(m.Images) != 1 || m.Images[0].RepositoryPath != "v/app" {
+	if m.Version != "2.4.1+build.5/x" || len(m.Images) != 1 || m.Images[0].RepositoryPath != "v/app" {
 		t.Fatalf("manifest %+v", m)
 	}
 	var back map[string]any

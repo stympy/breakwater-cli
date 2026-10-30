@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"text/tabwriter"
@@ -26,20 +27,17 @@ func newReleasesCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			releases, err := api.New(origin, creds).Releases(cmd.Context(), product)
+			releases, rawData, err := api.New(origin, creds).ReleasesRaw(cmd.Context(), product)
 			if err != nil {
 				return err
 			}
 			out := cmd.OutOrStdout()
 			if asJSON {
-				if releases == nil {
-					releases = []api.Release{}
-				}
-				b, err := json.MarshalIndent(releases, "", "  ")
-				if err != nil {
+				var buf bytes.Buffer
+				if err := json.Indent(&buf, rawData, "", "  "); err != nil {
 					return err
 				}
-				_, err = fmt.Fprintln(out, string(b))
+				_, err := fmt.Fprintln(out, buf.String())
 				return err
 			}
 			if len(releases) == 0 {

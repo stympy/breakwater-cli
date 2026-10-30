@@ -74,6 +74,12 @@ func TestReleasesJSON(t *testing.T) {
 			t.Fatalf("missing %q in %s", want, out)
 		}
 	}
+	srv3 := releasesServer(t, `{"data":[{"product":{"name":"P","slug":"p"},"version":"1","published_at":null,"future":{"a":1}}]}`, 200)
+	ios, out, _ = testIO("", testEnv)
+	execute(ios, []string{"releases", "--host", srv3.URL, "--json"})
+	if !strings.Contains(out.String(), "\"future\": {\n      \"a\": 1\n    }") {
+		t.Fatalf("unknown fields lost: %s", out)
+	}
 	srv2 := releasesServer(t, `{"data":[]}`, 200)
 	ios, out, _ = testIO("", testEnv)
 	execute(ios, []string{"releases", "--host", srv2.URL, "--json"})

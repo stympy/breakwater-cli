@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -122,11 +123,11 @@ func checkStatus(resp *http.Response) error {
 	case resp.StatusCode == http.StatusForbidden && parsed.Error == "plan_required":
 		e.Message = "air-gapped bundles aren't included in this vendor's Breakwater plan"
 	case resp.StatusCode == http.StatusTooManyRequests:
-		after := resp.Header.Get("Retry-After")
-		if after == "" {
-			after = "a few"
+		if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs >= 0 {
+			e.Message = fmt.Sprintf("rate limited by Breakwater; try again in %ds", secs)
+		} else {
+			e.Message = "rate limited by Breakwater; try again later"
 		}
-		e.Message = fmt.Sprintf("rate limited by Breakwater; try again in %ss", after)
 	default:
 		if msg == "" {
 			msg = strings.TrimSpace(string(raw))
@@ -174,17 +175,28 @@ func (c *Client) doJSON(ctx context.Context, method, escapedPath, query string, 
 
 // Releases lists the releases this token can see, optionally for one product.
 func (c *Client) Releases(ctx context.Context, product string) ([]Release, error) {
+	releases, _, err := c.ReleasesRaw(ctx, product)
+	return releases, err
+}
+
+// ReleasesRaw is Releases that also returns the server's "data" array as
+// sent, so callers can pass fields this client doesn't know through.
+func (c *Client) ReleasesRaw(ctx context.Context, product string) ([]Release, json.RawMessage, error) {
 	query := ""
 	if product != "" {
 		query = url.Values{"product": {product}}.Encode()
 	}
 	var out struct {
-		Data []Release `json:"data"`
+		Data json.RawMessage `json:"data"`
 	}
 	if _, err := c.doJSON(ctx, http.MethodGet, "/api/v1/customer/releases", query, nil, &out, ""); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out.Data, nil
+	var releases []Release
+	if err := json.Unmarshal(out.Data, &releases); err != nil {
+		return nil, nil, fmt.Errorf("Breakwater API returned an invalid release list: %w", err)
+	}
+	return releases, out.Data, nil
 }
 
 func releasePath(product, version string) string {
@@ -198,6 +210,12 @@ func (c *Client) Manifest(ctx context.Context, product, version string) (*Manife
 	raw, err := c.doJSON(ctx, http.MethodGet, releasePath(product, version), "", nil, &m, notFound)
 	if err != nil {
 		return nil, nil, err
+	}
+	if m.Product.Slug != product {
+		return nil, nil, fmt.Errorf("the manifest is for product %q, not %q", m.Product.Slug, product)
+	}
+	if m.Version != version {
+		return nil, nil, fmt.Errorf("the manifest is for version %q, not %q", m.Version, version)
 	}
 	if err := validateManifest(&m); err != nil {
 		return nil, nil, err
@@ -229,6 +247,22 @@ func validateManifest(m *Manifest) error {
 			return fmt.Errorf("manifest image %q is internal but has no repository_path or tag", img.Reference)
 		}
 	}
+	seen := map[string]bool{}
+	for _, f := range m.Files {
+		if !fileNamePattern.MatchString(f.Name) {
+			return fmt.Errorf("manifest file name %q isn't allowed", f.Name)
+		}
+		if seen[f.Name] {
+			return fmt.Errorf("manifest lists file %s twice", f.Name)
+		}
+		seen[f.Name] = true
+		if !sha256Pattern.MatchString(f.SHA256) {
+			return fmt.Errorf("manifest file %s has an invalid sha256 %q", f.Name, f.SHA256)
+		}
+		if f.Size < 0 {
+			return fmt.Errorf("manifest file %s has an invalid size %d", f.Name, f.Size)
+		}
+	}
 	return nil
 }
 
@@ -253,6 +287,7 @@ func originString(u *url.URL) string {
 }
 
 // DownloadFile streams a release file to w, verifying its size and SHA-256.
+// On any error w may hold unverified bytes; callers must discard them.
 // The URL must be on the API origin, since credentials go with the request.
 func (c *Client) DownloadFile(ctx context.Context, f ManifestFile, w io.Writer) error {
 	if !fileNamePattern.MatchString(f.Name) {
