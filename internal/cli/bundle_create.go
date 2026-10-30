@@ -590,8 +590,13 @@ type corruptBlob struct{ msg string }
 func (c *corruptBlob) Error() string { return c.msg }
 
 // retryable is false for a registry's definite refusal (a 4xx other than
-// 408 and 429); network errors and corrupt bytes are worth another try.
+// 408 and 429) and for a rate limit ggcr already retried; network errors
+// and corrupt bytes are worth another try.
 func retryable(err error) bool {
+	var limited *images.RateLimitError
+	if errors.As(err, &limited) {
+		return false
+	}
 	var terr *ggcrtransport.Error
 	if errors.As(err, &terr) {
 		s := terr.StatusCode

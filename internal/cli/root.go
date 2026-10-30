@@ -43,17 +43,23 @@ type globals struct {
 	username      string
 	passwordStdin bool
 	caFile        string
+
+	transport *http.Transport
 }
 
 // Transport is the HTTP transport for every request: ggcr's defaults with a
 // response-header timeout, trusting --ca-file's certificates as well as
 // the system's.
 func (g *globals) Transport() (*http.Transport, error) {
+	if g.transport != nil {
+		return g.transport, nil
+	}
 	roots, err := transport.LoadCAFile(g.caFile)
 	if err != nil {
 		return nil, err
 	}
-	return transport.New(roots), nil
+	g.transport = transport.New(roots)
+	return g.transport, nil
 }
 
 // APIClient is a customer API client for --host with creds.

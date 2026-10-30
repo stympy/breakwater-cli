@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/stympy/breakwater-cli/internal/api"
 	"github.com/stympy/breakwater-cli/internal/bundle"
+	"github.com/stympy/breakwater-cli/internal/images"
 )
 
 // fakeAPI is the customer API for bundle create: the manifest, one file and
@@ -617,5 +619,15 @@ func TestBundleCreateCapsReleaseFiles(t *testing.T) {
 		if len(f.api.started) != 0 {
 			t.Fatal("bundle event started")
 		}
+	}
+}
+
+func TestRetryableSkipsRateLimitsGgcrAlreadyRetried(t *testing.T) {
+	limited := fmt.Errorf("pulling: %w", &images.RateLimitError{})
+	if retryable(limited) {
+		t.Fatal("a rate limit was retried again")
+	}
+	if !retryable(errors.New("connection reset")) {
+		t.Fatal("a network error wasn't retried")
 	}
 }

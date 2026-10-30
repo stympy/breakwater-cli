@@ -195,8 +195,21 @@ func rateLimited(r *Resolved, err error) error {
 	if !isRateLimit(r, err) {
 		return err
 	}
-	return fmt.Errorf("%s rate-limited this anonymous pull of %s; pass --platform to fetch fewer manifests, or try again later", r.Ref.Context().RegistryStr(), r.Image.Reference)
+	return &RateLimitError{
+		msg: fmt.Sprintf("%s rate-limited this anonymous pull of %s; pass --platform to fetch fewer manifests, or try again later", r.Ref.Context().RegistryStr(), r.Image.Reference),
+		err: err,
+	}
 }
+
+// RateLimitError is an external registry's rate limit, after ggcr's own
+// retries. It keeps the registry's error for errors.As.
+type RateLimitError struct {
+	msg string
+	err error
+}
+
+func (e *RateLimitError) Error() string { return e.msg }
+func (e *RateLimitError) Unwrap() error { return e.err }
 
 // fetch gets a manifest or index by digest, checks it against d (digest,
 // size, media type) and records it. what names a child in errors.
