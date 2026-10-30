@@ -68,6 +68,8 @@ func (g *globals) APIOrigin() (*url.URL, error) {
 
 // newRootCommand builds the command tree. Each subcommand file adds itself here.
 func newRootCommand(ios *IOStreams) *cobra.Command {
+	own := *ios // don't mutate the caller's streams
+	ios = &own
 	if ios.Getenv == nil {
 		ios.Getenv = os.Getenv
 	}

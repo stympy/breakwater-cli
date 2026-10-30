@@ -4,10 +4,12 @@
 
 ## Commands
 
+Go 1.26 comes from mise; the default `go` on PATH may be older, so prefix every command with `mise exec go@1.26 --`.
+
 ```bash
 mise exec go@1.26 -- go test ./...      # no network or Docker needed
 mise exec go@1.26 -- go vet ./...
-go build ./cmd/breakwater && ./breakwater version
+mise exec go@1.26 -- go build ./cmd/breakwater && ./breakwater version
 ```
 
 Version is set with `-ldflags "-X github.com/stympy/breakwater-cli/internal/version.Version=..."` (default `dev`).
