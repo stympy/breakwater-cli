@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,9 +18,11 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	ggcrtransport "github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/stympy/breakwater-cli/internal/api"
 	"github.com/stympy/breakwater-cli/internal/bundle"
+	"github.com/stympy/breakwater-cli/internal/transport"
 )
 
 // maxConfigSize caps an image config read to learn its platform.
@@ -32,11 +35,13 @@ type Collector struct {
 	RegistryHost string
 	Auth         authn.Authenticator
 	UserAgent    string
-	// Transport defaults to remote.DefaultTransport.
+	// Transport defaults to transport.New(nil).
 	Transport http.RoundTripper
 	// InsecureRegistries are hosts that may be reached over plain HTTP
 	// (tests).
 	InsecureRegistries []string
+
+	backoff *remote.Backoff // ggcr's retry backoff, shortened in tests
 }
 
 // RawManifest is a manifest or index as the registry served it.
@@ -61,6 +66,8 @@ type Resolved struct {
 	// index's descriptors or, for a lone image, its config. An artifact has
 	// none.
 	Platforms []string
+	// Warnings are for the user: requested platforms the image lacks.
+	Warnings []string
 
 	puller *remote.Puller
 }
@@ -72,7 +79,7 @@ func (c *Collector) puller(internal bool, host string) (*remote.Puller, error) {
 	}
 	t := c.Transport
 	if t == nil {
-		t = remote.DefaultTransport
+		t = transport.New(nil)
 	}
 	if !slices.Contains(c.InsecureRegistries, host) {
 		// ggcr falls back to plain HTTP for localhost, loopback, .local and
@@ -80,6 +87,9 @@ func (c *Collector) puller(internal bool, host string) (*remote.Puller, error) {
 		t = HTTPSOnly(t, host, "only hosts in --insecure-registries may use it")
 	}
 	opts := []remote.Option{remote.WithAuth(auth), remote.WithTransport(t)}
+	if c.backoff != nil {
+		opts = append(opts, remote.WithRetryBackoff(*c.backoff))
+	}
 	if c.UserAgent != "" {
 		opts = append(opts, remote.WithUserAgent(c.UserAgent))
 	}
@@ -141,7 +151,7 @@ func (c *Collector) Resolve(ctx context.Context, img api.ManifestImage, platform
 		return nil, err
 	}
 	r := &Resolved{Image: img, Ref: ref, puller: p}
-	w := &walker{ctx: ctx, r: r, what: img.Reference, seenM: map[v1.Hash]bool{}, seenB: map[v1.Hash]bool{}}
+	w := &walker{ctx: ctx, r: r, what: img.Reference, platforms: platforms, seenM: map[v1.Hash]bool{}, seenB: map[v1.Hash]bool{}}
 
 	want, err := v1.NewHash(img.Digest)
 	if err != nil {
@@ -170,7 +180,22 @@ type walker struct {
 	ctx          context.Context
 	r            *Resolved
 	what         string
+	platforms    []string // requested; nil means all
 	seenM, seenB map[v1.Hash]bool
+}
+
+// warn records a warning for the user.
+func (w *walker) warn(format string, args ...any) {
+	w.r.Warnings = append(w.r.Warnings, fmt.Sprintf(format, args...))
+}
+
+// rateLimited rewrites a registry's 429 (TOOMANYREQUESTS) on an anonymous
+// pull of an external image into advice; other errors pass through.
+func rateLimited(r *Resolved, err error) error {
+	if !isRateLimit(r, err) {
+		return err
+	}
+	return fmt.Errorf("%s rate-limited this anonymous pull of %s; pass --platform to fetch fewer manifests, or try again later", r.Ref.Context().RegistryStr(), r.Image.Reference)
 }
 
 // fetch gets a manifest or index by digest, checks it against d (digest,
@@ -191,6 +216,9 @@ func (w *walker) fetch(d v1.Descriptor, what string) ([]byte, error) {
 	}
 	desc, err := w.r.puller.Get(w.ctx, w.r.Ref.Context().Digest(d.Digest.String()))
 	if err != nil {
+		if isRateLimit(w.r, err) {
+			return nil, rateLimited(w.r, err)
+		}
 		return nil, fmt.Errorf("%s: %w", label, err)
 	}
 	raw := desc.Manifest
@@ -235,13 +263,30 @@ func (w *walker) index(raw []byte, platforms []string) error {
 			kept = append(kept, d)
 		}
 	}
+	has := strings.Join(available, ", ")
+	if has == "" {
+		has = "no platforms"
+	}
 	if len(kept) == 0 {
-		has := strings.Join(available, ", ")
-		if has == "" {
-			has = "no platforms"
+		if platforms == nil {
+			return fmt.Errorf("image %s: its index lists no manifests", w.what)
 		}
 		return fmt.Errorf("image %s has no manifest for %s; it has %s", w.what, strings.Join(platforms, ", "), has)
 	}
+	var missing []string
+	for _, p := range platforms {
+		found := false
+		for _, d := range im.Manifests {
+			if !bundle.IsAttestation(d) && bundle.PlatformMatches(d.Platform, []string{p}) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, p)
+		}
+	}
+
 	for _, d := range kept {
 		w.r.Children = append(w.r.Children, d.Digest.String())
 		if p := bundle.PlatformString(d.Platform); p != "" && !bundle.IsAttestation(d) {
@@ -265,6 +310,9 @@ func (w *walker) index(raw []byte, platforms []string) error {
 		default:
 			return fmt.Errorf("image %s: child %s has unsupported media type %s", w.what, d.Digest, d.MediaType)
 		}
+	}
+	if len(missing) > 0 {
+		w.warn("image %s has no manifest for %s; the bundle keeps only its %s", w.what, strings.Join(missing, ", "), strings.Join(w.r.Platforms, ", "))
 	}
 	return nil
 }
@@ -332,9 +380,25 @@ func (w *walker) manifest(d v1.Descriptor, raw []byte, lone bool) error {
 		}
 		if p != "" {
 			w.addPlatform(p)
+			if w.platforms != nil && !bundle.PlatformMatches(parsePlatform(p), w.platforms) {
+				w.warn("image %s is only for %s, not %s; the bundle has it as is", w.what, p, strings.Join(w.platforms, ", "))
+			}
 		}
 	}
 	return nil
+}
+
+// parsePlatform parses "os/arch[/variant]".
+func parsePlatform(s string) *v1.Platform {
+	parts := strings.SplitN(s, "/", 3)
+	p := &v1.Platform{OS: parts[0]}
+	if len(parts) > 1 {
+		p.Architecture = parts[1]
+	}
+	if len(parts) > 2 {
+		p.Variant = parts[2]
+	}
+	return p
 }
 
 func isSchema1(mt types.MediaType) bool {
@@ -369,6 +433,22 @@ func (w *walker) addPlatform(p string) {
 	}
 }
 
+func isRateLimit(r *Resolved, err error) bool {
+	var terr *ggcrtransport.Error
+	if r.Image.Kind == "internal" || !errors.As(err, &terr) {
+		return false
+	}
+	if terr.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	for _, d := range terr.Errors {
+		if d.Code == ggcrtransport.TooManyRequestsErrorCode {
+			return true
+		}
+	}
+	return false
+}
+
 // FetchBlob streams a config or layer of a resolved image from its
 // repository, by digest, with the same credentials rule as Resolve. Foreign
 // layers are fetched from the registry like any other. The caller checks
@@ -380,7 +460,11 @@ func (c *Collector) FetchBlob(ctx context.Context, r *Resolved, d v1.Descriptor)
 func fetchBlob(ctx context.Context, r *Resolved, d v1.Descriptor) (io.ReadCloser, error) {
 	l, err := r.puller.Layer(ctx, r.Ref.Context().Digest(d.Digest.String()))
 	if err != nil {
-		return nil, err
+		return nil, rateLimited(r, err)
 	}
-	return l.Compressed()
+	rc, err := l.Compressed()
+	if err != nil {
+		return nil, rateLimited(r, err)
+	}
+	return rc, nil
 }

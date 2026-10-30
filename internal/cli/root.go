@@ -4,13 +4,16 @@ package cli
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"unicode"
 
 	"github.com/spf13/cobra"
+	"github.com/stympy/breakwater-cli/internal/api"
 	"github.com/stympy/breakwater-cli/internal/credentials"
+	"github.com/stympy/breakwater-cli/internal/transport"
 )
 
 const (
@@ -39,6 +42,27 @@ type globals struct {
 	registryHost  string
 	username      string
 	passwordStdin bool
+	caFile        string
+}
+
+// Transport is the HTTP transport for every request: ggcr's defaults with a
+// response-header timeout, trusting --ca-file's certificates as well as
+// the system's.
+func (g *globals) Transport() (*http.Transport, error) {
+	roots, err := transport.LoadCAFile(g.caFile)
+	if err != nil {
+		return nil, err
+	}
+	return transport.New(roots), nil
+}
+
+// APIClient is a customer API client for --host with creds.
+func (g *globals) APIClient(origin *url.URL, creds credentials.Credentials) (*api.Client, error) {
+	tr, err := g.Transport()
+	if err != nil {
+		return nil, err
+	}
+	return api.New(origin, creds, api.WithHTTPClient(&http.Client{Transport: tr})), nil
 }
 
 // Credentials resolves credentials per the documented order.
@@ -95,6 +119,7 @@ func newRootCommand(ios *IOStreams) *cobra.Command {
 	f.StringVar(&g.registryHost, "registry-host", defaultRegistryHost, "Breakwater registry host")
 	f.StringVar(&g.username, "username", "", "username (use with --password-stdin)")
 	f.BoolVar(&g.passwordStdin, "password-stdin", false, "read the password (a pull token) from stdin")
+	f.StringVar(&g.caFile, "ca-file", "", "also trust the CA certificates in this PEM file (for a TLS-inspecting proxy or a private registry)")
 
 	root.AddCommand(newVersionCommand(g))
 	root.AddCommand(newReleasesCommand(g))

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/stympy/breakwater-cli/internal/api"
 )
 
 func newReleasesCommand(g *globals) *cobra.Command {
@@ -27,7 +26,11 @@ func newReleasesCommand(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			releases, rawData, err := api.New(origin, creds).ReleasesRaw(cmd.Context(), product)
+			client, err := g.APIClient(origin, creds)
+			if err != nil {
+				return err
+			}
+			releases, rawData, err := client.ReleasesRaw(cmd.Context(), product)
 			if err != nil {
 				return err
 			}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -629,5 +630,80 @@ func TestBearerFlowBlobRedirectCarriesNoCredentials(t *testing.T) {
 		if !strings.HasSuffix(s, " ") {
 			t.Fatalf("storage got credentials: %q", s)
 		}
+	}
+}
+
+func TestResolveWarnsAboutMissingPlatforms(t *testing.T) {
+	r := newTestRegistry(t, nil)
+	mi := r.push(t, "acme/api:2.4.1", "internal", multiPlatformIndex(t))
+	res, err := collector(r).Resolve(context.Background(), mi, []string{"linux/amd64", "linux/s390x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "image " + mi.Reference + " has no manifest for linux/s390x; the bundle keeps only its linux/amd64"
+	if !slices.Equal(res.Warnings, []string{want}) {
+		t.Fatalf("warnings %q\nwant %q", res.Warnings, want)
+	}
+	res, err = collector(r).Resolve(context.Background(), mi, []string{"linux/amd64", "linux/arm64"})
+	if err != nil || len(res.Warnings) != 0 {
+		t.Fatalf("all present: %v %q", err, res.Warnings)
+	}
+}
+
+func TestResolveWarnsAboutALoneImageForAnotherPlatform(t *testing.T) {
+	r := newTestRegistry(t, nil)
+	img, err := mutate.ConfigFile(randomImage(t), &v1.ConfigFile{OS: "linux", Architecture: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi := r.push(t, "acme/api:2.4.1", "internal", img)
+	res, err := collector(r).Resolve(context.Background(), mi, []string{"linux/arm64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "image " + mi.Reference + " is only for linux/amd64, not linux/arm64; the bundle has it as is"
+	if !slices.Equal(res.Warnings, []string{want}) {
+		t.Fatalf("warnings %q", res.Warnings)
+	}
+	if res, _ := collector(r).Resolve(context.Background(), mi, []string{"linux/amd64"}); len(res.Warnings) != 0 {
+		t.Fatalf("matching platform warned: %q", res.Warnings)
+	}
+}
+
+func TestResolveEmptyIndex(t *testing.T) {
+	r := newTestRegistry(t, nil)
+	mi := r.push(t, "acme/api:2.4.1", "internal", empty.Index)
+	_, err := collector(r).Resolve(context.Background(), mi, nil)
+	if err == nil || err.Error() != "image "+mi.Reference+": its index lists no manifests" {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestResolveExplainsAnonymousRateLimits(t *testing.T) {
+	limit := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if strings.Contains(req.URL.Path, "/manifests/") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				w.Write([]byte(`{"errors":[{"code":"TOOMANYREQUESTS","message":"You have reached your pull rate limit."}]}`))
+				return
+			}
+			h.ServeHTTP(w, req)
+		})
+	}
+	r := newTestRegistry(t, limit)
+	mi := r.push(t, "library/redis:7", "external", randomImage(t))
+	c := collector(r)
+	c.backoff = &remote.Backoff{Duration: time.Millisecond, Factor: 1, Steps: 2} // ggcr retries 429s
+	_, err := c.Resolve(context.Background(), mi, nil)
+	want := r.Host + " rate-limited this anonymous pull of " + mi.Reference + "; pass --platform to fetch fewer manifests, or try again later"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err %v\nwant %s", err, want)
+	}
+
+	// Internal images aren't anonymous: the registry's own error stands.
+	mi = r.push(t, "acme/api:1", "internal", randomImage(t))
+	if _, err := c.Resolve(context.Background(), mi, nil); err == nil || strings.Contains(err.Error(), "anonymous") {
+		t.Fatalf("internal: %v", err)
 	}
 }

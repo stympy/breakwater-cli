@@ -1,8 +1,11 @@
 package cli
 
 import (
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -101,4 +104,34 @@ func TestReleasesErrors(t *testing.T) {
 	if code := execute(ios, []string{"releases", "--host", srv.URL}); code != 1 || !strings.Contains(errb.String(), "refused the credentials") {
 		t.Fatalf("stderr %q", errb)
 	}
+}
+
+func TestCAFileIsTrustedForTheAPI(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(twoReleases))
+	}))
+	t.Cleanup(srv.Close)
+	ios, _, errb := testIO("", testEnv)
+	if code := execute(ios, []string{"releases", "--host", srv.URL}); code != 1 || !strings.Contains(errb.String(), "certificate") {
+		t.Fatalf("without --ca-file: exit %d: %s", code, errb)
+	}
+	ca := writeCA(t, srv)
+	ios, out, errb := testIO("", testEnv)
+	if code := execute(ios, []string{"releases", "--host", srv.URL, "--ca-file", ca}); code != 0 || !strings.Contains(out.String(), "worker") {
+		t.Fatalf("with --ca-file: exit %d: %s", code, errb)
+	}
+	ios, _, errb = testIO("", testEnv)
+	if code := execute(ios, []string{"releases", "--host", srv.URL, "--ca-file", ca + ".missing"}); code != 1 || !strings.Contains(errb.String(), "--ca-file") {
+		t.Fatalf("missing --ca-file: exit %d: %s", code, errb)
+	}
+}
+
+// writeCA writes a TLS test server's certificate as a PEM file.
+func writeCA(t *testing.T, srv *httptest.Server) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

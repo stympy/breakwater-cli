@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	ggcrtransport "github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/spf13/cobra"
 	"github.com/stympy/breakwater-cli/internal/api"
@@ -160,7 +163,14 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 	if err != nil {
 		return err
 	}
-	client := api.New(origin, creds)
+	tr, err := g.Transport()
+	if err != nil {
+		return err
+	}
+	client, err := g.APIClient(origin, creds)
+	if err != nil {
+		return err
+	}
 	m, rawManifest, err := client.Manifest(ctx, o.product, o.version)
 	if err != nil {
 		return err
@@ -174,6 +184,7 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 		RegistryHost:       g.registryHost,
 		Auth:               authn.FromConfig(authn.AuthConfig{Username: creds.Username, Password: creds.Password}),
 		UserAgent:          version.UserAgent(),
+		Transport:          tr,
 		InsecureRegistries: o.insecure,
 	}
 	var resolved []*images.Resolved
@@ -183,6 +194,9 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 		r, err := col.Resolve(ctx, img, platforms)
 		if err != nil {
 			return err
+		}
+		for _, w := range r.Warnings {
+			fmt.Fprintf(stderr, "warning: %s\n", clean(w))
 		}
 		resolved = append(resolved, r)
 		resolvedPlatforms = append(resolvedPlatforms, r.Platforms)
@@ -213,7 +227,7 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 	bins := []selfdist.Binary{running}
 	if others := selfdist.Others(o.cliBinaries); len(others) > 0 {
 		fmt.Fprintf(stderr, "Downloading breakwater %s for %s\n", version.Version, strings.Join(others, ", "))
-		downloaded, err := selfdist.Download(ctx, version.Version, o.cliBinaries, &http.Client{}, "")
+		downloaded, err := selfdist.Download(ctx, version.Version, o.cliBinaries, &http.Client{Transport: tr}, "")
 		if err != nil {
 			return err
 		}
@@ -226,7 +240,8 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 	if err != nil {
 		return err
 	}
-	if err := writeBundle(ctx, g, col, plan, out, o.force); err != nil {
+	sum, err := writeBundle(ctx, g, col, plan, out, o.force)
+	if err != nil {
 		return err
 	}
 	st, err := os.Stat(out)
@@ -244,6 +259,7 @@ func runBundleCreate(ctx context.Context, cmd *cobra.Command, g *globals, o crea
 	// 12. The result.
 	stdout := g.io.Out
 	fmt.Fprintf(stdout, "Wrote %s (%s): %s, %s\n", out, humanSize(st.Size()), plural(len(m.Images), "image"), plural(len(m.Files), "file"))
+	fmt.Fprintf(stdout, "Bundle SHA-256: %s\n", sum)
 	fmt.Fprintf(stdout, "Next: carry it across, then run: breakwater bundle load %s --docker\n", out)
 	fmt.Fprintf(stdout, "      (or --registry <host>[/<prefix>] to push the images to a private registry)\n")
 	return nil
@@ -389,17 +405,17 @@ func planBundle(m *api.Manifest, rawManifest json.RawMessage, platforms []string
 }
 
 // writeBundle writes the plan to <out>.partial, syncs it and renames it to
-// out. On any failure, including a cancelled ctx, the .partial is removed
-// and nothing is left at out.
-func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bundlePlan, out string, force bool) (err error) {
+// out, returning the file's SHA-256 (hex). On any failure, including a
+// cancelled ctx, the .partial is removed and nothing is left at out.
+func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bundlePlan, out string, force bool) (sum string, err error) {
 	partial := out + ".partial"
 	// O_EXCL: never reuse or follow whatever is there, symlinks included.
 	f, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if errors.Is(err, fs.ErrExist) {
-		return fmt.Errorf("%s exists (another bundle create running, or a stale one); remove it and try again", partial)
+		return "", fmt.Errorf("%s exists (another bundle create running, or a stale one); remove it and try again", partial)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() {
 		if err != nil {
@@ -407,7 +423,8 @@ func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bund
 			os.Remove(partial)
 		}
 	}()
-	bw := bufio.NewWriterSize(f, 1<<20)
+	fileHash := sha256.New()
+	bw := bufio.NewWriterSize(io.MultiWriter(f, fileHash), 1<<20)
 	w := bundle.NewWriter(bw, p.header)
 	for _, e := range p.front {
 		w.Declare(e.path, e.size, e.sha256)
@@ -421,11 +438,11 @@ func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bund
 		w.Declare(e.path, e.size, e.sha256)
 	}
 	if err := w.Begin(); err != nil {
-		return err
+		return "", err
 	}
 	for _, e := range p.front {
 		if err := w.Add(e.path, bytes.NewReader(e.data)); err != nil {
-			return err
+			return "", err
 		}
 	}
 	for _, ip := range p.images {
@@ -436,10 +453,10 @@ func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bund
 		fmt.Fprintf(g.io.Err, "Pulling %s (%s, %s)\n", clean(ip.resolved.Image.Reference), plural(len(ip.blobs), "blob"), humanSize(total))
 		for _, e := range ip.blobs {
 			if err := ctx.Err(); err != nil {
-				return err
+				return "", err
 			}
-			if err := addBlob(ctx, w, col, ip.resolved, e); err != nil {
-				return fmt.Errorf("image %s: blob %s: %w", ip.resolved.Image.Reference, e.blob.Digest, err)
+			if err := addBlob(ctx, w, col, ip.resolved, e, filepath.Dir(out)); err != nil {
+				return "", fmt.Errorf("image %s: blob %s: %w", ip.resolved.Image.Reference, e.blob.Digest, err)
 			}
 		}
 	}
@@ -448,35 +465,35 @@ func writeBundle(ctx context.Context, g *globals, col *images.Collector, p *bund
 		if e.file != "" {
 			src, err := os.Open(e.file)
 			if err != nil {
-				return err
+				return "", err
 			}
 			defer src.Close()
 			r = src
 		}
 		if err := w.Add(e.path, r); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if err := w.Close(); err != nil {
-		return err
+		return "", err
 	}
 	if err := bw.Flush(); err != nil {
-		return err
+		return "", err
 	}
 	if err := f.Sync(); err != nil {
-		return err
+		return "", err
 	}
 	if err := f.Close(); err != nil {
-		return err
+		return "", err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 	if err := publish(partial, out, force); err != nil {
-		return err
+		return "", err
 	}
 	syncDir(filepath.Dir(out))
-	return nil
+	return hex.EncodeToString(fileHash.Sum(nil)), nil
 }
 
 // publish moves the finished partial to out. With force it renames over
@@ -501,13 +518,86 @@ func publish(partial, out string, force bool) error {
 	return os.Rename(partial, out)
 }
 
-func addBlob(ctx context.Context, w *bundle.Writer, col *images.Collector, r *images.Resolved, e entry) error {
+// blobAttempts and blobRetryDelay bound addBlob's retries.
+var (
+	blobAttempts   = 3
+	blobRetryDelay = 2 * time.Second
+)
+
+// addBlob downloads a blob to a temporary file in dir, checking its size
+// and digest, and retries a failed or corrupt download (up to blobAttempts
+// in all), then adds the file to the bundle. The temporary file is always
+// removed.
+func addBlob(ctx context.Context, w *bundle.Writer, col *images.Collector, r *images.Resolved, e entry, dir string) error {
+	tmp, err := os.CreateTemp(dir, ".breakwater-blob-*") // O_EXCL
+	if err != nil {
+		return err
+	}
+	defer func() {
+		tmp.Close()
+		os.Remove(tmp.Name())
+	}()
+	for attempt := 1; ; attempt++ {
+		err = downloadBlob(ctx, col, r, e, tmp)
+		if err == nil {
+			break
+		}
+		if attempt >= blobAttempts || ctx.Err() != nil || !retryable(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(blobRetryDelay * time.Duration(attempt)):
+		}
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return w.Add(e.path, tmp)
+}
+
+// downloadBlob writes a blob to f (truncating it first) and checks its
+// size and SHA-256.
+func downloadBlob(ctx context.Context, col *images.Collector, r *images.Resolved, e entry, f *os.File) error {
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	rc, err := col.FetchBlob(ctx, r, *e.blob)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	return w.Add(e.path, rc)
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(rc, e.size+1))
+	if err != nil {
+		return err
+	}
+	if n != e.size {
+		return &corruptBlob{fmt.Sprintf("the registry sent %d bytes (or more), not %d", n, e.size)}
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != e.sha256 {
+		return &corruptBlob{fmt.Sprintf("the registry sent bytes with sha256 %s", got)}
+	}
+	return nil
+}
+
+type corruptBlob struct{ msg string }
+
+func (c *corruptBlob) Error() string { return c.msg }
+
+// retryable is false for a registry's definite refusal (a 4xx other than
+// 408 and 429); network errors and corrupt bytes are worth another try.
+func retryable(err error) bool {
+	var terr *ggcrtransport.Error
+	if errors.As(err, &terr) {
+		s := terr.StatusCode
+		return s < 400 || s >= 500 || s == http.StatusRequestTimeout || s == http.StatusTooManyRequests
+	}
+	return true
 }
 
 // syncDir makes a rename durable where the platform allows it.

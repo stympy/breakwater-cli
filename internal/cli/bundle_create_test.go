@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
@@ -90,9 +91,33 @@ type createFixture struct {
 	external         string
 	externalAuth     *[]string
 	corruptBlob      *string // a blob path the internal registry serves flipped
+	cutBlob          *cutBlob
 	index            v1.ImageIndex
 	out              string
 	internalImageRef string
+}
+
+// cutBlob makes the internal registry drop the connection halfway through
+// the first n GETs of path.
+type cutBlob struct {
+	mu   sync.Mutex
+	path string
+	n    int
+	gets int
+}
+
+func (c *cutBlob) cut(r *http.Request) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r.Method != "GET" || c.path == "" || r.URL.Path != c.path {
+		return false
+	}
+	c.gets++
+	if c.n > 0 {
+		c.n--
+		return true
+	}
+	return false
 }
 
 func quietRegistry() http.Handler {
@@ -101,7 +126,7 @@ func quietRegistry() http.Handler {
 
 func newCreateFixture(t *testing.T) *createFixture {
 	t.Helper()
-	f := &createFixture{externalAuth: &[]string{}, corruptBlob: new(string)}
+	f := &createFixture{externalAuth: &[]string{}, corruptBlob: new(string), cutBlob: &cutBlob{}}
 
 	// internal registry
 	reg := quietRegistry()
@@ -113,6 +138,16 @@ func newCreateFixture(t *testing.T) *createFixture {
 			w.Header().Set("WWW-Authenticate", `Basic realm="breakwater"`)
 			w.WriteHeader(401)
 			return
+		}
+		if f.cutBlob.cut(r) {
+			rec := httptest.NewRecorder()
+			reg.ServeHTTP(rec, r)
+			body := rec.Body.Bytes()
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			w.WriteHeader(rec.Code)
+			w.Write(body[:len(body)/2])
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler) // drop the connection mid-body
 		}
 		corruptMu.Lock()
 		bad := *f.corruptBlob
@@ -291,6 +326,21 @@ func TestBundleCreateWithPlatform(t *testing.T) {
 	if len(f.api.started) != 1 || !slices.Equal(f.api.started[0], []string{"linux/arm64"}) {
 		t.Fatalf("started %v", f.api.started)
 	}
+	// The external image is linux/amd64 only: kept, with a warning.
+	if want := "warning: image " + f.external + "/library/redis:7 is only for linux/amd64, not linux/arm64; the bundle has it as is\n"; !strings.Contains(errb.String(), want) {
+		t.Fatalf("stderr %q lacks %q", errb, want)
+	}
+}
+
+func TestBundleCreateWarnsAboutAMissingPlatform(t *testing.T) {
+	f := newCreateFixture(t)
+	ios, _, errb := testIO("", testEnv)
+	if code := execute(ios, f.args("--platform", "linux/amd64,linux/s390x")); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb)
+	}
+	if want := "warning: image " + f.internalImageRef + " has no manifest for linux/s390x; the bundle keeps only its linux/amd64\n"; !strings.Contains(errb.String(), want) {
+		t.Fatalf("stderr %q lacks %q", errb, want)
+	}
 }
 
 func TestBundleCreateUnknownPlatform(t *testing.T) {
@@ -339,6 +389,8 @@ func TestBundleCreateStartFailureStillWrites(t *testing.T) {
 }
 
 func TestBundleCreateCorruptBlobLeavesNothing(t *testing.T) {
+	defer func(d time.Duration) { blobRetryDelay = d }(blobRetryDelay)
+	blobRetryDelay = 0
 	f := newCreateFixture(t)
 	im, _ := f.index.IndexManifest()
 	child, _ := f.index.Image(im.Manifests[1].Digest)
@@ -357,8 +409,76 @@ func TestBundleCreateCorruptBlobLeavesNothing(t *testing.T) {
 		t.Fatal("output written")
 	}
 	noPartial(t, f.out)
+	onlyFiles(t, filepath.Dir(f.out))
 	if len(f.api.started) != 1 || len(f.api.completed) != 0 {
 		t.Fatalf("started %v, completed %v", f.api.started, f.api.completed)
+	}
+}
+
+func TestBundleCreateRetriesABlobCutOffMidBody(t *testing.T) {
+	defer func(d time.Duration) { blobRetryDelay = d }(blobRetryDelay)
+	blobRetryDelay = 0
+	f := newCreateFixture(t)
+	im, _ := f.index.IndexManifest()
+	child, _ := f.index.Image(im.Manifests[0].Digest)
+	layers, _ := child.Layers()
+	d, _ := layers[0].Digest()
+	f.cutBlob.path, f.cutBlob.n = "/v2/acme/api/blobs/"+d.String(), 1
+
+	ios, out, errb := testIO("", testEnv)
+	if code := execute(ios, f.args()); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb)
+	}
+	if f.cutBlob.gets != 2 {
+		t.Fatalf("%d GETs of the blob, want 2", f.cutBlob.gets)
+	}
+	b, err := bundle.Open(f.out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	onlyFiles(t, filepath.Dir(f.out), filepath.Base(f.out))
+	if want := "Bundle SHA-256: " + fileSHA256(t, f.out) + "\n"; !strings.Contains(out.String(), want) {
+		t.Fatalf("stdout %q lacks %q", out, want)
+	}
+}
+
+func TestBundleCreateGivesUpOnAPersistentlyCutBlob(t *testing.T) {
+	defer func(d time.Duration) { blobRetryDelay = d }(blobRetryDelay)
+	blobRetryDelay = 0
+	f := newCreateFixture(t)
+	im, _ := f.index.IndexManifest()
+	child, _ := f.index.Image(im.Manifests[0].Digest)
+	layers, _ := child.Layers()
+	d, _ := layers[0].Digest()
+	f.cutBlob.path, f.cutBlob.n = "/v2/acme/api/blobs/"+d.String(), 100
+
+	ios, _, errb := testIO("", testEnv)
+	if code := execute(ios, f.args()); code != 1 || !strings.Contains(errb.String(), d.String()) {
+		t.Fatalf("exit %d: %s", code, errb)
+	}
+	if f.cutBlob.gets != blobAttempts {
+		t.Fatalf("%d GETs of the blob, want %d", f.cutBlob.gets, blobAttempts)
+	}
+	if _, err := os.Stat(f.out); !os.IsNotExist(err) {
+		t.Fatal("output written")
+	}
+	onlyFiles(t, filepath.Dir(f.out)) // no .partial, no temporary blob
+}
+
+// onlyFiles checks dir holds exactly the named files.
+func onlyFiles(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	if !slices.Equal(got, names) {
+		t.Fatalf("%s holds %v, want %v", dir, got, names)
 	}
 }
 
