@@ -10,6 +10,7 @@ Go 1.26 comes from mise; the default `go` on PATH may be older, so prefix every 
 mise exec go@1.26 -- go test ./...      # no network or Docker needed
 mise exec go@1.26 -- go vet ./...
 mise exec go@1.26 -- go build ./cmd/breakwater && ./breakwater version
+mise exec go@1.26 -- script/integration   # real registry:2 in Docker (BW_TEST_REGISTRY), build tag `integration`
 ```
 
 Version is set with `-ldflags "-X github.com/stympy/breakwater-cli/internal/version.Version=..."` (default `dev`).
