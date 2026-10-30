@@ -57,7 +57,7 @@ func Validate(h *Header, idx *Index, ra io.ReaderAt) (*Summary, error) {
 	v := &validator{
 		h: h, idx: idx, ra: ra,
 		used:    make(map[string]bool, len(idx.Entries)),
-		walks:   map[walkKey][]IndexEntry{},
+		walks:   map[walkKey]walkResult{},
 		indexes: map[v1.Hash]*v1.IndexManifest{},
 	}
 	return v.run()
@@ -72,7 +72,7 @@ type validator struct {
 	idx     *Index
 	ra      io.ReaderAt
 	used    map[string]bool
-	walks   map[walkKey][]IndexEntry
+	walks   map[walkKey]walkResult
 	indexes map[v1.Hash]*v1.IndexManifest
 	walked  int
 }
@@ -293,8 +293,8 @@ func (v *validator) image(img Image, mi api.ManifestImage) (ImageInfo, error) {
 			return info, fmt.Errorf("child %s isn't in its index", c)
 		}
 		if !isAttestation(d) && v.h.Platforms != nil {
-			p := platformString(d.Platform)
-			if !slices.Contains(v.h.Platforms, p) {
+			if !platformWanted(d.Platform, v.h.Platforms) {
+				p := platformString(d.Platform)
 				if p == "" {
 					p = "no platform"
 				}
@@ -336,11 +336,36 @@ func platformString(p *v1.Platform) string {
 	return s
 }
 
+// platformWanted reports whether p matches one of the requested platforms:
+// OS and architecture must be equal, and the variant too when the request
+// names one ("linux/arm64" matches linux/arm64/v8; "linux/arm/v7" doesn't
+// match linux/arm/v6).
+func platformWanted(p *v1.Platform, wanted []string) bool {
+	if p == nil {
+		return false
+	}
+	for _, w := range wanted {
+		parts := strings.Split(w, "/")
+		if len(parts) < 2 || parts[0] != p.OS || parts[1] != p.Architecture {
+			continue
+		}
+		if len(parts) == 2 || parts[2] == p.Variant {
+			return true
+		}
+	}
+	return false
+}
+
 func isAttestation(d v1.Descriptor) bool {
 	if d.Annotations[referenceTypeAnnotation] == "attestation-manifest" {
 		return true
 	}
 	return d.Platform != nil && d.Platform.OS == "unknown" && d.Platform.Architecture == "unknown"
+}
+
+type walkResult struct {
+	blobs     []IndexEntry
+	mediaType types.MediaType
 }
 
 type walkKey struct {
@@ -358,8 +383,15 @@ func (v *validator) walk(what string, d v1.Descriptor, nestedOK bool) ([]IndexEn
 		return nil, err
 	}
 	key := walkKey{d.Digest, nestedOK}
-	if blobs, ok := v.walks[key]; ok {
-		return blobs, nil
+	if r, ok := v.walks[key]; ok {
+		// The subtree was checked; this descriptor of it still must be right.
+		if _, err := v.blob(what, d); err != nil {
+			return nil, err
+		}
+		if d.MediaType != r.mediaType {
+			return nil, fmt.Errorf("%s %s has media type %s here but %s elsewhere", what, d.Digest, d.MediaType, r.mediaType)
+		}
+		return r.blobs, nil
 	}
 	var blobs []IndexEntry
 	switch {
@@ -395,7 +427,7 @@ func (v *validator) walk(what string, d v1.Descriptor, nestedOK bool) ([]IndexEn
 	default:
 		return nil, fmt.Errorf("child %s has unsupported media type %s", d.Digest, d.MediaType)
 	}
-	v.walks[key] = blobs
+	v.walks[key] = walkResult{blobs: blobs, mediaType: d.MediaType}
 	return blobs, nil
 }
 
@@ -403,6 +435,9 @@ func (v *validator) walk(what string, d v1.Descriptor, nestedOK bool) ([]IndexEn
 // lists a digest twice is refused.
 func (v *validator) index(d v1.Descriptor, e IndexEntry) (*v1.IndexManifest, error) {
 	if im, ok := v.indexes[d.Digest]; ok {
+		if im.MediaType != "" && im.MediaType != d.MediaType {
+			return nil, fmt.Errorf("index %s says media type %s, but its descriptor says %s", d.Digest, im.MediaType, d.MediaType)
+		}
 		return im, nil
 	}
 	raw, err := readSmall(v.ra, e, MaxManifestSize)

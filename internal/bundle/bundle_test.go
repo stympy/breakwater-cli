@@ -2,6 +2,7 @@ package bundle_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/stympy/breakwater-cli/internal/api"
 	"github.com/stympy/breakwater-cli/internal/bundle"
 	"github.com/stympy/breakwater-cli/internal/bundle/bundletest"
@@ -377,6 +379,85 @@ func TestBlobCloseReportsAMismatchAfterAnExactRead(t *testing.T) {
 	}
 	if err := rc.Close(); err == nil || !strings.Contains(err.Error(), "doesn't match its digest") {
 		t.Fatalf("Close err %v", err)
+	}
+}
+
+// tamperedIndex is an index whose manifest has been edited after the fact;
+// its children are still fetched from the original.
+type tamperedIndex struct {
+	baseIndex // an alias, so the embedded field doesn't shadow the ImageIndex method
+	im        *v1.IndexManifest
+}
+
+type baseIndex = v1.ImageIndex
+
+func (x tamperedIndex) IndexManifest() (*v1.IndexManifest, error) { return x.im, nil }
+func (x tamperedIndex) RawManifest() ([]byte, error)              { return json.Marshal(x.im) }
+
+func tamper(t *testing.T, idx v1.ImageIndex, edit func(*v1.IndexManifest)) v1.ImageIndex {
+	t.Helper()
+	im, err := idx.IndexManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := im.DeepCopy()
+	edit(cp)
+	return tamperedIndex{baseIndex: idx, im: cp}
+}
+
+// TestReusedDescriptorsAreStillChecked: a child validated once through one
+// index is reached again through another index whose descriptor for it is
+// wrong; the memoized walk must not hide that.
+func TestReusedDescriptorsAreStillChecked(t *testing.T) {
+	index := bundletest.PlatformIndex(t, "linux/amd64")
+	cases := []struct {
+		name string
+		edit func(*v1.IndexManifest)
+		want string
+	}{
+		{"size", func(im *v1.IndexManifest) { im.Manifests[0].Size++ }, "image docker.io/library/b:1: manifest sha256:"},
+		{"media type", func(im *v1.IndexManifest) { im.Manifests[0].MediaType = types.OCIManifestSchema1 }, "has media type " + string(types.OCIManifestSchema1) + " here but"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			opts := bundletest.Options{Images: []bundletest.Image{
+				{Kind: "external", Reference: "docker.io/library/a:1", Index: index},
+				{Kind: "external", Reference: "docker.io/library/b:1", Index: tamper(t, index, c.edit)},
+			}}
+			_, err := bundle.Open(bundletest.Build(t, opts))
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err %v; want %q", err, c.want)
+			}
+		})
+	}
+}
+
+func TestPlatformVariants(t *testing.T) {
+	cases := []struct {
+		child, wanted string
+		ok            bool
+	}{
+		{"linux/arm64/v8", "linux/arm64", true},
+		{"linux/arm64/v8", "linux/arm64/v8", true},
+		{"linux/arm/v6", "linux/arm/v7", false},
+		{"linux/arm64", "linux/arm64/v8", false},
+		{"linux/amd64", "linux/arm64", false},
+	}
+	for _, c := range cases {
+		opts := bundletest.Options{
+			Platforms: []string{c.wanted},
+			Images:    []bundletest.Image{{Kind: "external", Reference: "docker.io/library/a:1", Index: bundletest.PlatformIndex(t, c.child)}},
+		}
+		b, err := bundle.Open(bundletest.Build(t, opts))
+		if c.ok && err != nil {
+			t.Errorf("%s under %s: %v", c.child, c.wanted, err)
+		}
+		if !c.ok && (err == nil || !strings.Contains(err.Error(), "isn't one of the bundle's platforms")) {
+			t.Errorf("%s under %s: err %v", c.child, c.wanted, err)
+		}
+		if err == nil {
+			b.Close()
+		}
 	}
 }
 
