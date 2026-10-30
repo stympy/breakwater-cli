@@ -77,7 +77,7 @@ func (c *Collector) puller(internal bool, host string) (*remote.Puller, error) {
 	if !slices.Contains(c.InsecureRegistries, host) {
 		// ggcr falls back to plain HTTP for localhost, loopback, .local and
 		// RFC 1918 hosts; only hosts listed as insecure may use it.
-		t = &httpsOnly{inner: t, host: host}
+		t = HTTPSOnly(t, host, "only hosts in --insecure-registries may use it")
 	}
 	opts := []remote.Option{remote.WithAuth(auth), remote.WithTransport(t)}
 	if c.UserAgent != "" {
@@ -86,17 +86,23 @@ func (c *Collector) puller(internal bool, host string) (*remote.Puller, error) {
 	return remote.NewPuller(opts...)
 }
 
-// httpsOnly refuses plain-HTTP requests to a registry host. Requests to
-// other hosts (blob redirects to storage, which get no credentials and are
-// checked by digest) pass.
+// HTTPSOnly wraps inner so it refuses plain-HTTP requests to a registry
+// host, which ggcr would otherwise fall back to for localhost, loopback,
+// .local and RFC 1918 hosts. hint, in the error, says how to allow it.
+// Requests to other hosts (blob redirects to storage, which get no
+// credentials and are checked by digest) pass.
+func HTTPSOnly(inner http.RoundTripper, host, hint string) http.RoundTripper {
+	return &httpsOnly{inner: inner, host: host, hint: hint}
+}
+
 type httpsOnly struct {
-	inner http.RoundTripper
-	host  string
+	inner      http.RoundTripper
+	host, hint string
 }
 
 func (t *httpsOnly) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.Scheme != "https" && r.URL.Host == t.host {
-		return nil, fmt.Errorf("refusing plain HTTP to registry %s; only hosts in --insecure-registries may use it", t.host)
+		return nil, fmt.Errorf("refusing plain HTTP to registry %s; %s", t.host, t.hint)
 	}
 	return t.inner.RoundTrip(r)
 }

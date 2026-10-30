@@ -5,10 +5,10 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
-	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/stympy/breakwater-cli/internal/bundle"
+	"github.com/stympy/breakwater-cli/internal/term"
 )
 
 // newBundleCommand is the parent of the bundle subcommands.
@@ -19,6 +19,7 @@ func newBundleCommand(g *globals) *cobra.Command {
 	}
 	cmd.AddCommand(newBundleCreateCommand(g))
 	cmd.AddCommand(newBundleVerifyCommand(g))
+	cmd.AddCommand(newBundleLoadCommand(g))
 	return cmd
 }
 
@@ -87,14 +88,7 @@ func printBundleSummary(g *globals, b *bundle.Bundle) {
 
 // clean drops control and format characters (escape sequences, bidi
 // overrides) from bundle-supplied text before it reaches a terminal.
-func clean(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return -1
-		}
-		return r
-	}, s)
-}
+func clean(s string) string { return term.Clean(s) }
 
 // shortDigest is "sha256:" and the first 12 hex characters.
 func shortDigest(d string) string {
