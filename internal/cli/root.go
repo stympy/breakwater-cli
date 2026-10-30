@@ -97,6 +97,7 @@ func newRootCommand(ios *IOStreams) *cobra.Command {
 
 	root.AddCommand(newVersionCommand(g))
 	root.AddCommand(newReleasesCommand(g))
+	root.AddCommand(newBundleCommand(g))
 	return root
 }
 

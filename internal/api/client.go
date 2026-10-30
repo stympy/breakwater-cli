@@ -217,13 +217,15 @@ func (c *Client) Manifest(ctx context.Context, product, version string) (*Manife
 	if m.Version != version {
 		return nil, nil, fmt.Errorf("the manifest is for version %q, not %q", m.Version, version)
 	}
-	if err := validateManifest(&m); err != nil {
+	if err := ValidateManifest(&m); err != nil {
 		return nil, nil, err
 	}
 	return &m, raw, nil
 }
 
-func validateManifest(m *Manifest) error {
+// ValidateManifest checks a manifest the way the client does when it fetches
+// one: format, kinds, digests, references and file names.
+func ValidateManifest(m *Manifest) error {
 	if m.Format > SupportedManifestFormat {
 		return fmt.Errorf("this release uses manifest format %d; upgrade breakwater", m.Format)
 	}
