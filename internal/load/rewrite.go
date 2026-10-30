@@ -136,15 +136,26 @@ func RewriteFiles(b *bundle.Bundle, dir string, mappings []Mapping, keepDigests 
 	}
 
 	l := newLookup(mappings)
-	var written []string
+	var written, names []string
+	// On a failure, remove what this run wrote, so a retry finds no
+	// conflicts.
+	fail := func(err error) ([]string, error) {
+		for _, n := range names {
+			_ = root.Remove(n)
+		}
+		return nil, err
+	}
 	for _, f := range files {
 		path := filepath.Join(dir, f.name)
+		if testHookBeforeOpen != nil {
+			testHookBeforeOpen(root, f.name)
+		}
 		fh, err := root.OpenFile(f.name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if errors.Is(err, fs.ErrExist) {
-			return written, fmt.Errorf("%s already exists; not overwriting it", path)
+			return fail(fmt.Errorf("%s already exists; not overwriting it", path))
 		}
 		if err != nil {
-			return written, err
+			return fail(err)
 		}
 		_, err = fh.Write([]byte(l.rewrite(string(f.content), keepDigests)))
 		if cerr := fh.Close(); err == nil {
@@ -152,12 +163,16 @@ func RewriteFiles(b *bundle.Bundle, dir string, mappings []Mapping, keepDigests 
 		}
 		if err != nil {
 			_ = root.Remove(f.name)
-			return written, fmt.Errorf("writing %s: %w", path, err)
+			return fail(fmt.Errorf("writing %s: %w", path, err))
 		}
+		names = append(names, f.name)
 		written = append(written, path)
 	}
 	return written, nil
 }
+
+// testHookBeforeOpen, if set, runs before each file is created (tests).
+var testHookBeforeOpen func(root *os.Root, name string)
 
 type lookup struct {
 	byName   map[string]Mapping   // Docker-normalized From

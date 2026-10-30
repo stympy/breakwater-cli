@@ -287,3 +287,24 @@ func TestToDockerRefusesTwoImagesUnderOneName(t *testing.T) {
 		t.Fatal("ran docker load")
 	}
 }
+
+func TestToDockerLoadsTheSameImageOnce(t *testing.T) {
+	cmd, saved := fakeDocker(t, "linux/amd64", 0)
+	redis := bundletest.RandomImage(t)
+	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{
+		{Kind: "external", Reference: "redis:7", Image: redis},
+		{Kind: "external", Reference: "docker.io/library/redis:7", Image: redis},
+	}})
+	var out bytes.Buffer
+	ms, _, err := ToDocker(context.Background(), b, cmd, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 1 || strings.Count(out.String(), "Loaded docker.io/library/redis:7\n") != 1 {
+		t.Fatalf("mappings %+v, output %q", ms, out.String())
+	}
+	m, err := tarball.LoadManifest(func() (io.ReadCloser, error) { return os.Open(saved) })
+	if err != nil || len(m) != 1 || len(m[0].RepoTags) != 1 {
+		t.Fatalf("archive %+v %v", m, err)
+	}
+}

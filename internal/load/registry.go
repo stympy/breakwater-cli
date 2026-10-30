@@ -26,10 +26,11 @@ import (
 // TargetName is the name an image gets under registry ("host[/prefix]"):
 // an internal image keeps its repository path and tag, and an external one
 // keeps its whole Docker-normalized reference, registry host first, so
-// "postgres:16.4" becomes "<registry>/docker.io/library/postgres:16.4". It
-// returns "" when the image's reference doesn't parse. The result still
-// needs checking with name.ParseReference: an external image on a registry
-// with a port gives no valid name.
+// "postgres:16.4" becomes "<registry>/docker.io/library/postgres:16.4". A
+// port in that host can't be in a repository path, so its ':' becomes '_':
+// "localhost:6000/x:1" becomes "<registry>/localhost_6000/x:1". It returns
+// "" when the image's reference doesn't parse; the result still needs
+// checking with name.ParseReference.
 func TargetName(img bundle.Image, registry string) string {
 	if img.Kind == "internal" {
 		return registry + "/" + img.RepositoryPath + ":" + img.Tag
@@ -38,11 +39,19 @@ func TargetName(img bundle.Image, registry string) string {
 	if err != nil {
 		return ""
 	}
-	return registry + "/" + n
+	host, rest, _ := strings.Cut(n, "/")
+	return registry + "/" + strings.ReplaceAll(host, ":", "_") + "/" + rest
 }
 
-// checkRegistry checks --registry: a host, optionally a port, and an
-// optional repository prefix, with no scheme, tag or trailing slash.
+// CheckRegistry checks a --registry value: a host, optionally a port, and
+// an optional repository prefix, with no scheme, tag or trailing slash.
+func CheckRegistry(registry string) error {
+	_, err := checkRegistry(registry)
+	return err
+}
+
+// checkRegistry is CheckRegistry, returning the registry host as ggcr
+// names it ("index.docker.io" for "docker.io").
 func checkRegistry(registry string) (string, error) {
 	if registry == "" {
 		return "", errors.New("--registry needs a host, like registry.example.com or registry.example.com/prefix")
@@ -51,7 +60,8 @@ func checkRegistry(registry string) (string, error) {
 		return "", fmt.Errorf("--registry %q: give host[/prefix], without a scheme", registry)
 	}
 	host, prefix, hasPrefix := strings.Cut(registry, "/")
-	if _, err := name.NewRegistry(host, name.StrictValidation); err != nil || strings.Contains(host, "@") {
+	reg, err := name.NewRegistry(host, name.StrictValidation)
+	if err != nil || strings.Contains(host, "@") {
 		return "", fmt.Errorf("--registry %q: invalid host %q", registry, host)
 	}
 	if hasPrefix {
@@ -59,7 +69,7 @@ func checkRegistry(registry string) (string, error) {
 			return "", fmt.Errorf("--registry %q: invalid repository prefix %q (use lowercase path segments, like mirror/acme)", registry, prefix)
 		}
 	}
-	return host, nil
+	return reg.RegistryStr(), nil
 }
 
 type target struct {
@@ -75,29 +85,9 @@ type target struct {
 // listing the kept children. auth may be nil (anonymous). The registry is
 // reached over HTTPS only unless insecure is set.
 func ToRegistry(ctx context.Context, b *bundle.Bundle, registry string, auth authn.Authenticator, insecure bool, out io.Writer) ([]Mapping, error) {
-	host, err := checkRegistry(registry)
+	host, targets, err := planTargets(b.Header().Images, registry, insecure)
 	if err != nil {
 		return nil, err
-	}
-	var nameOpts []name.Option
-	if insecure {
-		nameOpts = append(nameOpts, name.Insecure)
-	}
-
-	// Name every image before pushing anything.
-	var targets []target
-	seen := map[string]bundle.Image{}
-	for _, img := range b.Header().Images {
-		to := TargetName(img, registry)
-		tag, err := name.NewTag(to, nameOpts...)
-		if err != nil || to == "" || tag.RegistryStr() != host {
-			return nil, fmt.Errorf("image %s can't be named under %s", term.Clean(img.Reference), registry)
-		}
-		if prev, ok := seen[tag.Name()]; ok && (prev.Digest != img.Digest || !slices.Equal(prev.Children, img.Children)) {
-			return nil, fmt.Errorf("images %s and %s would both be pushed as %s", term.Clean(prev.Reference), term.Clean(img.Reference), to)
-		}
-		seen[tag.Name()] = img
-		targets = append(targets, target{img, tag})
 	}
 
 	if auth == nil {
@@ -137,6 +127,35 @@ func ToRegistry(ctx context.Context, b *bundle.Bundle, registry string, auth aut
 		fmt.Fprintf(out, "note: %d image(s) got a new digest because the bundle keeps only some platforms; use --rewrite-files for files that pin digests.\n", changed)
 	}
 	return mappings, nil
+}
+
+// planTargets names every image under registry before anything is pushed,
+// returning the registry host as ggcr names it.
+func planTargets(imgs []bundle.Image, registry string, insecure bool) (string, []target, error) {
+	host, err := checkRegistry(registry)
+	if err != nil {
+		return "", nil, err
+	}
+	var nameOpts []name.Option
+	if insecure {
+		nameOpts = append(nameOpts, name.Insecure)
+	}
+
+	var targets []target
+	seen := map[string]bundle.Image{}
+	for _, img := range imgs {
+		to := TargetName(img, registry)
+		tag, err := name.NewTag(to, nameOpts...)
+		if err != nil || to == "" || tag.RegistryStr() != host {
+			return "", nil, fmt.Errorf("image %s can't be named under %s", term.Clean(img.Reference), registry)
+		}
+		if prev, ok := seen[tag.Name()]; ok && (prev.Digest != img.Digest || !slices.Equal(prev.Children, img.Children)) {
+			return "", nil, fmt.Errorf("images %s and %s would both be pushed as %s", term.Clean(prev.Reference), term.Clean(img.Reference), to)
+		}
+		seen[tag.Name()] = img
+		targets = append(targets, target{img, tag})
+	}
+	return host, targets, nil
 }
 
 type pusher struct {
@@ -263,8 +282,10 @@ func (p *pusher) blob(repo name.Repository, d v1.Descriptor) error {
 	return nil
 }
 
-// filterIndex is raw with "manifests" cut down to the kept children; every
-// other field, and each kept descriptor, is as it was.
+// filterIndex is raw with "manifests" cut down to the kept children. The
+// result is re-marshaled, so every other field and each kept descriptor is
+// equal as JSON to the original (not byte for byte: whitespace and key
+// order may change).
 func filterIndex(raw []byte, kept []v1.Descriptor) ([]byte, error) {
 	keep := map[string]bool{}
 	for _, d := range kept {

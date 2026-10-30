@@ -33,7 +33,8 @@ your own registry (--registry host[/prefix]).
 
 With --registry, internal images go to <registry>/<repository>:<tag> and
 external ones to <registry>/<original registry>/<repository>:<tag>, such as
-<registry>/docker.io/library/postgres:16.4. --username and --password-stdin
+<registry>/docker.io/library/postgres:16.4 (a port in that host becomes
+"_": <registry>/localhost_5000/tool:1). --username and --password-stdin
 give the registry's credentials; without them, Docker's credential store is
 used, or none.
 
@@ -66,6 +67,17 @@ func runBundleLoad(cmd *cobra.Command, g *globals, path string, o loadOptions) e
 	defer stop()
 	stderr, stdout := g.io.Err, g.io.Out
 
+	// Check the target before the (slow) verification.
+	var auth authn.Authenticator
+	if !o.docker {
+		if err := load.CheckRegistry(o.registry); err != nil {
+			return err
+		}
+		var err error
+		if auth, err = registryAuth(cmd, g, o.registry); err != nil {
+			return err
+		}
+	}
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}
@@ -93,10 +105,6 @@ func runBundleLoad(cmd *cobra.Command, g *globals, path string, o loadOptions) e
 			fmt.Fprintf(stderr, "warning: nothing was loaded; Docker can't run any of the bundle's %s (push them to a registry with --registry instead)\n", plural(len(skipped), "image"))
 		}
 	} else {
-		auth, err := registryAuth(cmd, g, o.registry)
-		if err != nil {
-			return err
-		}
 		fmt.Fprintf(stderr, "Pushing the images to %s\n", o.registry)
 		mappings, err = load.ToRegistry(ctx, b, o.registry, auth, o.insecure, stdout)
 		if err != nil {

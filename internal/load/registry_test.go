@@ -41,6 +41,8 @@ func TestTargetName(t *testing.T) {
 		{"prefix", internal, "reg.example.com/mirror/acme", "reg.example.com/mirror/acme/acme/api:2.4.1"},
 		{"port", ext("redis:7"), "localhost:5000", "localhost:5000/docker.io/library/redis:7"},
 		{"port and prefix", internal, "10.0.0.5:5000/bw", "10.0.0.5:5000/bw/acme/api:2.4.1"},
+		{"external on a host with a port", ext("localhost:6000/x:1"), "reg.example.com", "reg.example.com/localhost_6000/x:1"},
+		{"external on an IP and port", ext("10.1.2.3:443/team/x"), "reg.example.com/m", "reg.example.com/m/10.1.2.3_443/team/x:latest"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := TargetName(tc.img, tc.registry)
@@ -52,11 +54,24 @@ func TestTargetName(t *testing.T) {
 			}
 		})
 	}
-	// An external image on a registry with a port can't be nested under
-	// another registry: the result is no valid name.
-	if got := TargetName(ext("localhost:6000/x:1"), "reg.example.com"); got != "" {
-		if _, err := name.ParseReference(got); err == nil {
-			t.Fatalf("%q parses", got)
+}
+
+func TestPlanTargets(t *testing.T) {
+	imgs := []bundle.Image{
+		{Kind: "internal", Reference: "registry.breakwaterapp.com/acme/api:2.4.1", RepositoryPath: "acme/api", Tag: "2.4.1"},
+		{Kind: "external", Reference: "redis:7"},
+	}
+	for _, tc := range []struct{ registry, host, first string }{
+		{"docker.io/mirror", "index.docker.io", "index.docker.io/mirror/acme/api:2.4.1"},
+		{"docker.io", "index.docker.io", "index.docker.io/acme/api:2.4.1"},
+		{"reg.example.com:5000/m", "reg.example.com:5000", "reg.example.com:5000/m/acme/api:2.4.1"},
+	} {
+		host, targets, err := planTargets(imgs, tc.registry, false)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.registry, err)
+		}
+		if host != tc.host || len(targets) != 2 || targets[0].tag.Name() != tc.first {
+			t.Fatalf("%s: host %q, targets %+v", tc.registry, host, targets)
 		}
 	}
 }
@@ -357,10 +372,10 @@ func TestToRegistryRefusesBadTargets(t *testing.T) {
 	host, n := testRegistry(t)
 	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{
 		{Image: bundletest.RandomImage(t)},
-		{Kind: "external", Reference: "localhost:6000/x:1", Image: bundletest.RandomImage(t)},
+		{Kind: "external", Reference: "UPPER/x:1", Image: bundletest.RandomImage(t)},
 	}})
 	_, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "localhost:6000/x:1") {
+	if err == nil || !strings.Contains(err.Error(), "UPPER/x:1") {
 		t.Fatalf("err = %v", err)
 	}
 	for _, bad := range []string{"", "https://" + host, host + "/", host + "/UPPER", host + ":tag"} {
@@ -385,5 +400,24 @@ func TestToRegistryRefusesTwoImagesUnderOneName(t *testing.T) {
 	}
 	if n.Load() != 0 {
 		t.Fatalf("%d requests reached the registry", n.Load())
+	}
+}
+
+func TestToRegistryExternalImageOnAPort(t *testing.T) {
+	host, _ := testRegistry(t)
+	img := bundletest.RandomImage(t)
+	b, _ := openBundle(t, bundletest.Options{Images: []bundletest.Image{
+		{Kind: "external", Reference: "localhost:6000/x:1", Image: img},
+	}})
+	ms, err := ToRegistry(context.Background(), b, host, nil, true, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ms[0].To != host+"/localhost_6000/x:1" {
+		t.Fatalf("mapping %+v", ms[0])
+	}
+	desc, err := remote.Head(ref(t, host+"/localhost_6000/x:1"))
+	if err != nil || desc.Digest != digestOf(t, img) {
+		t.Fatalf("%v %v", desc, err)
 	}
 }

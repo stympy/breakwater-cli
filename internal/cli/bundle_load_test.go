@@ -211,3 +211,19 @@ func TestBundleLoadToDockerAllSkipped(t *testing.T) {
 		t.Fatalf("stderr %q", errb)
 	}
 }
+
+func TestBundleLoadChecksTheRegistryBeforeVerifying(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.tar")
+	ios, _, errb := testIO("", testEnv)
+	if code := execute(ios, []string{"bundle", "load", missing, "--registry", "https://reg.example.com"}); code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(errb.String(), "without a scheme") || strings.Contains(errb.String(), "Verifying") {
+		t.Fatalf("stderr %q", errb)
+	}
+	// --username without --password-stdin fails before the bundle is read.
+	ios, _, errb = testIO("", testEnv)
+	if code := execute(ios, []string{"bundle", "load", missing, "--registry", "reg.example.com", "--username", "u"}); code != 1 || !strings.Contains(errb.String(), "--username requires --password-stdin") {
+		t.Fatalf("exit %d, stderr %q", code, errb)
+	}
+}

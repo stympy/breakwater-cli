@@ -22,7 +22,7 @@ Version is set with `-ldflags "-X github.com/stympy/breakwater-cli/internal/vers
 - `internal/credentials`: credential resolution
 - `internal/bundle`: bundle format: `Writer`, streaming `Scan` (the hostile-input checks), `Open`/`Validate`; `bundle/bundletest` builds test bundles from ggcr images for any package's tests
 - `internal/images`: `Collector` resolves release images by digest (platform filtering, credentials only for internal images on `--registry-host`) and streams their blobs
-- `internal/load`: `bundle load`: `ToRegistry` (push by digest, then the top level under the tag; a filtered index gets a new digest), `ToDocker` (one docker-archive streamed into `docker load`, for Docker's platform; non-image artifacts skipped), `RewriteFiles` (image: lines in compose/YAML files, written through `os.Root`)
+- `internal/load`: `bundle load`: `ToRegistry` (names: internal `<registry>/<repository_path>:<tag>`, external `<registry>/<original host, ':' as '_'>/<repo>:<tag>`; push by digest, then the top level under the tag; a filtered index gets a new digest), `ToDocker` (one docker-archive streamed into `docker load`, for Docker's platform; non-image artifacts skipped), `RewriteFiles` (image: lines in compose/YAML files, written through `os.Root`)
 - `internal/term`: `Clean` strips control and format characters from bundle or server text before it's printed
 - `internal/selfdist`: the running binary and `--cli-binaries` downloads from GitHub Releases, checked against `checksums.txt`
 - `internal/version`: version and User-Agent

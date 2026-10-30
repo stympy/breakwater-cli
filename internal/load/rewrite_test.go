@@ -235,3 +235,26 @@ func TestRewriteLine(t *testing.T) {
 		}
 	}
 }
+
+func TestRewriteFilesRemovesWhatItWroteOnFailure(t *testing.T) {
+	b := rewriteBundle(t)
+	dir := t.TempDir()
+	testHookBeforeOpen = func(root *os.Root, name string) {
+		if name == "values.yaml" { // appears after the check, before the write
+			if err := root.WriteFile(name, []byte("racer\n"), 0o644); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	t.Cleanup(func() { testHookBeforeOpen = nil })
+	written, err := RewriteFiles(b, dir, registryMappings, true)
+	if err == nil || !strings.Contains(err.Error(), "values.yaml already exists") || written != nil {
+		t.Fatalf("written %q, err %v", written, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "compose.yaml")); !os.IsNotExist(err) {
+		t.Fatal("compose.yaml was left behind")
+	}
+	if got := readFile(t, filepath.Join(dir, "values.yaml")); got != "racer\n" {
+		t.Fatalf("values.yaml %q", got)
+	}
+}

@@ -73,8 +73,11 @@ func ToDocker(ctx context.Context, b *bundle.Bundle, dockerCmd string, out io.Wr
 			skipped = append(skipped, Skipped{img.Reference, fmt.Sprintf("not a container image (%s)", m.Config.MediaType)})
 			continue
 		}
-		if prev, ok := byName[to]; ok && chosen[to] != d.Digest.String() {
-			return nil, nil, fmt.Errorf("images %s and %s would both be loaded as %s", term.Clean(prev.Reference), term.Clean(img.Reference), to)
+		if prev, ok := byName[to]; ok {
+			if chosen[to] != d.Digest.String() {
+				return nil, nil, fmt.Errorf("images %s and %s would both be loaded as %s", term.Clean(prev.Reference), term.Clean(img.Reference), to)
+			}
+			continue // the same image again: loaded once
 		}
 		byName[to] = img
 		chosen[to] = d.Digest.String()
@@ -181,9 +184,11 @@ func dockerPlatform(ctx context.Context, dockerCmd string) (string, error) {
 }
 
 // dockerLoad streams the images as one docker-archive into "docker load".
-// If writing fails (a blob that changed since the bundle was verified),
-// docker is killed before its stdin closes, and the archive's manifest.json,
-// written last, never reaches it.
+// The archive's manifest.json, which docker load needs to load anything, is
+// its last entry, so if writing fails partway (a blob that changed since
+// the bundle was verified) docker never gets a loadable archive. Docker is
+// also killed before its stdin closes, so it doesn't spend time on the
+// partial archive.
 func dockerLoad(ctx context.Context, dockerCmd string, refs map[name.Reference]v1.Image) error {
 	r, w, err := os.Pipe()
 	if err != nil {
