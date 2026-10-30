@@ -1,0 +1,38 @@
+version: 2
+
+project_name: breakwater
+
+builds:
+  - id: breakwater
+    main: ./cmd/breakwater
+    binary: breakwater
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X github.com/stympy/breakwater-cli/internal/version.Version={{.Version}}
+
+archives:
+  - id: default
+    ids: [breakwater]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "breakwater_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README*
+      - LICENSE
+  - id: raw
+    ids: [breakwater]
+    formats: [binary]
+    name_template: "breakwater_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: stympy
+    name: breakwater-cli
