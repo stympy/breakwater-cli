@@ -19,6 +19,10 @@ Go 1.26 or newer:
 go install github.com/stympy/breakwater-cli/cmd/breakwater@latest
 ```
 
+A `go install` build reports its version as `dev`, so `bundle create
+--cli-binaries` refuses to run with it (there are no `dev` binaries to
+download). Use a release binary for that.
+
 ## Credentials
 
 Use a customer pull token from the Breakwater portal. The CLI looks for
@@ -31,6 +35,16 @@ credentials in this order:
 
 Defaults: API `https://app.breakwaterapp.com` (`--host`) and registry
 `registry.breakwaterapp.com` (`--registry-host`).
+
+## Private CAs and TLS-inspecting proxies
+
+If your network re-signs TLS traffic, or your registry uses a private CA,
+pass `--ca-file <pem>`: the certificates in the file are trusted in addition
+to the system's. It applies to every command: the Breakwater API and
+registry, external registries and GitHub downloads in `bundle create`, and
+the `--registry` target of `bundle load`. On Linux, the standard
+`SSL_CERT_FILE` and `SSL_CERT_DIR` environment variables also work; they
+replace the system's certificates rather than adding to them.
 
 ## Commands
 
@@ -49,22 +63,55 @@ breakwater bundle create api 2.4.1
 breakwater bundle create api 2.4.1 --platform linux/amd64 -o api.bwbundle.tar
 ```
 
-- `--platform os/arch[/variant],...`: keep only these platforms of multi-platform images. Without it, all platforms are kept. A platform that an image doesn't have is an error naming the image.
+- `--platform os/arch[/variant],...`: keep only these platforms of multi-platform images. Without it, all platforms are kept. Releases often mix multi-platform and single-platform images, so an image that has only some of the requested platforms is kept for those with a warning, and a single-platform image for another platform is kept as is with a warning. An index with none of them is an error naming the image.
 - `-o`, `--output <file>`: where to write the bundle.
-- `--cli-binaries linux/amd64,windows/amd64`: also put `breakwater` binaries for these platforms in the bundle (downloaded from GitHub Releases and checked against `checksums.txt`), so the offline side can verify and load without installing anything. Available for linux, darwin and windows on amd64 and arm64.
+- `--cli-binaries linux/amd64,windows/amd64`: also put `breakwater` binaries for these platforms in the bundle (downloaded from GitHub Releases and checked against `checksums.txt`), so the offline side can verify and load without installing anything. Available for linux, darwin and windows on amd64 and arm64. The binary you're running is always included.
 - `--force`: overwrite the output file if it exists. If `create` fails partway, no file is left at the output path.
+
+Each layer is downloaded to a temporary file next to the output, checked
+against its digest, and retried (up to three tries) if the connection drops
+or the bytes don't match.
+
+When it's done, `create` prints the bundle's SHA-256. Write it down, or send
+it along by a separate channel, so whoever loads the bundle can check it
+arrived unchanged (see `verify`).
+
+Images hosted outside Breakwater, such as on Docker Hub, are pulled
+anonymously, so they count against that registry's anonymous pull limits
+(Docker Hub's are per IP address and low). A multi-platform image costs a
+pull for each platform's manifest, so `--platform` helps. If a registry
+rate-limits the pull, `create` says so; try again later.
 
 Breakwater records that you created a bundle. If that call fails, you get a
 warning and the bundle is still made.
 
+#### Using the binary in the bundle
+
+On the offline side, take the binary for that machine out of the bundle with
+`tar`:
+
+```bash
+tar -xf api-2.4.1.bwbundle.tar bin/breakwater_linux_amd64
+chmod +x bin/breakwater_linux_amd64
+bin/breakwater_linux_amd64 bundle verify api-2.4.1.bwbundle.tar
+```
+
 ### `breakwater bundle verify <file>`
 
-Checks the bundle's structure and every digest in it. It needs no network, so
-run it after you carry the bundle across.
+Checks the bundle's structure and that every entry matches the digests
+recorded in its `bundle.json`. It needs no network, so run it after you carry
+the bundle across.
 
 ```bash
 breakwater bundle verify api-2.4.1.bwbundle.tar
 ```
+
+That proves the bundle is internally consistent, not where it came from:
+someone who could change the bundle could also change `bundle.json`. To know
+it's the bundle that was made, compare the `Bundle SHA-256` that `verify`
+prints with the one `create` printed, passed to you separately. The full
+image digests it lists should also match the ones on the release page in the
+Breakwater portal.
 
 ### `breakwater bundle load <file>`
 
@@ -78,11 +125,18 @@ breakwater bundle load api-2.4.1.bwbundle.tar --docker
 breakwater bundle load api-2.4.1.bwbundle.tar --registry registry.example.com/mirror
 ```
 
-- `--docker`: load the images into the local Docker. Artifacts that aren't container images (Helm charts, Zarf packages) are skipped and listed.
+- `--docker`: load the images into the local Docker, for Docker's platform. Artifacts that aren't container images (Helm charts, Zarf packages) are skipped and listed.
+- `--platform os/arch[/variant]`: with `--docker`, load each image for this platform instead of Docker's.
 - `--registry host[/prefix]`: push the images to your registry.
-- `--username <name> --password-stdin`: the target registry's credentials. Without them, Docker's credential store is used, or none.
+- `--username <name> --password-stdin`: the target registry's credentials (with `--registry` only). Without them, Docker's credential store is used, or none.
 - `--insecure`: allow plain HTTP to the `--registry` host. Registries are otherwise reached only over HTTPS.
+- `--ca-file <pem>`: trust these CA certificates for the `--registry` host too.
 - `--rewrite-files <dir>`: write the release's compose and YAML files to `<dir>`, with their `image:` lines pointing at the loaded or pushed images.
+
+With `--docker`, compose files that pin images by digest
+(`image: ...@sha256:...`) won't work as they are, because `docker load`
+doesn't record registry digests. Use `--rewrite-files`; `load` reminds you
+when the bundle's files pin digests.
 
 #### Image names in your registry
 
@@ -106,7 +160,9 @@ understands is refused with a request to upgrade.
 ## Where your credentials go
 
 Your token goes only to the Breakwater API (`--host`) and the Breakwater
-registry (`--registry-host`). Images hosted elsewhere are pulled anonymously.
+registry (`--registry-host`), including the token service that registry
+names in its authentication challenge, as `docker login` does. Images hosted
+elsewhere are pulled anonymously.
 API requests never follow redirects, and a redirect to another host (such as
 blob storage) never carries your token. An image or file that claims to live
 on Breakwater but points at another host is an error, not a request.
@@ -114,7 +170,8 @@ on Breakwater but points at another host is an error, not a request.
 ## Reading bundles safely
 
 Treat a bundle as untrusted input. `verify` and `load` read it as a stream
-and refuse, before writing or pushing anything: a truncated or altered file,
+and refuse, before writing or pushing anything: a truncated or altered file
+(including one cut off at an entry boundary or with data appended),
 a changed byte in any layer, extra or duplicate entries, paths that escape
 (`../x`), symlinks, absurd declared sizes, and a `bundle.json` that isn't
 first. Text from a bundle is stripped of control characters before it's

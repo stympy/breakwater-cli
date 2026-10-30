@@ -22,8 +22,9 @@ Version is set with `-ldflags "-X github.com/stympy/breakwater-cli/internal/vers
 - `internal/api`: customer API client (never follows redirects; file downloads only from the API origin)
 - `internal/credentials`: credential resolution
 - `internal/bundle`: bundle format: `Writer`, streaming `Scan` (the hostile-input checks), `Open`/`Validate`; `bundle/bundletest` builds test bundles from ggcr images for any package's tests
-- `internal/images`: `Collector` resolves release images by digest (platform filtering, credentials only for internal images on `--registry-host`) and streams their blobs
-- `internal/load`: `bundle load`: `ToRegistry` (names: internal `<registry>/<repository_path>:<tag>`, external `<registry>/<original host, ':' as '_'>/<repo>:<tag>`; push by digest, then the top level under the tag; a filtered index gets a new digest), `ToDocker` (one docker-archive streamed into `docker load`, for Docker's platform; non-image artifacts skipped), `RewriteFiles` (image: lines in compose/YAML files, written through `os.Root`)
+- `internal/images`: `Collector` resolves release images by digest (platform filtering with warnings for missing platforms, credentials only for internal images on `--registry-host`, anonymous 429s turned into advice) and streams their blobs; `bundle create` downloads each blob to a temp file beside the output and retries it
+- `internal/load`: `bundle load`: `ToRegistry` (names: internal `<registry>/<repository_path>:<tag>`, external `<registry>/<original host, ':' as '_'>/<repo>:<tag>`; push by digest, then the top level under the tag; a filtered index gets a new digest), `ToDocker` (one docker-archive streamed into `docker load`, for Docker's platform or `--platform`, looking inside kept nested indexes; non-image artifacts skipped), `RewriteFiles` (image: lines in compose/YAML files, written through `os.Root`)
+- `internal/transport`: every HTTP transport (API, registries, GitHub): ggcr's defaults with a 60s response-header timeout, plus `--ca-file` roots added to the system's
 - `internal/term`: `Clean` strips control and format characters from bundle or server text before it's printed
 - `internal/selfdist`: the running binary and `--cli-binaries` downloads from GitHub Releases, checked against `checksums.txt`
 - `internal/version`: version and User-Agent
