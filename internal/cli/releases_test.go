@@ -94,7 +94,7 @@ func TestReleasesJSON(t *testing.T) {
 }
 
 func TestReleasesErrors(t *testing.T) {
-	srv := releasesServer(t, `{"error":"plan_required"}`, 403)
+	srv := releasesServer(t, `{"code":"plan_required","detail":"This vendor's plan doesn't include air-gapped bundles."}`, 403)
 	ios, _, errb := testIO("", testEnv)
 	if code := execute(ios, []string{"releases", "--host", srv.URL}); code != 1 {
 		t.Fatal(code)
