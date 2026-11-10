@@ -71,16 +71,16 @@ func TestErrorStatusMapping(t *testing.T) {
 		want    string
 		useMani bool
 	}{
-		{"401", 401, `{"error":"Unauthorized"}`, nil, `the API refused the credentials (use a customer pull token)`, false},
-		{"403 plan", 403, `{"error":"plan_required"}`, nil, `air-gapped bundles aren't included in this vendor's Breakwater plan`, false},
-		{"403 other", 403, `{"error":"nope"}`, nil, `Breakwater API returned 403: nope`, false},
-		{"404 manifest", 404, `{"error":"Resource not found"}`, nil, `no release 1.0.0 of p that this token can see`, true},
+		{"401", 401, `{"type":"https://www.breakwaterapp.com/docs/api/errors#invalid_token","title":"T","status":401,"detail":"The pull token is missing.","code":"invalid_token"}`, nil, `the API refused the credentials (use a customer pull token)`, false},
+		{"403 plan", 403, `{"type":"https://www.breakwaterapp.com/docs/api/errors#plan_required","title":"T","status":403,"detail":"This vendor's plan doesn't include air-gapped bundles.","code":"plan_required"}`, nil, `air-gapped bundles aren't included in this vendor's Breakwater plan`, false},
+		{"403 other", 403, `{"type":"https://www.breakwaterapp.com/docs/api/errors#forbidden","title":"T","status":403,"detail":"Nope.","code":"forbidden"}`, nil, `Breakwater API returned 403: Nope.`, false},
+		{"404 manifest", 404, `{"type":"https://www.breakwaterapp.com/docs/api/errors#not_found","title":"T","status":404,"detail":"Nothing was found at this address.","code":"not_found"}`, nil, `no release 1.0.0 of p that this token can see`, true},
 		{"429", 429, `{}`, map[string]string{"Retry-After": "7"}, `rate limited by Breakwater; try again in 7s`, false},
 		{"429 none", 429, `{}`, nil, `rate limited by Breakwater; try again later`, false},
 		{"429 date", 429, `{}`, map[string]string{"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, `rate limited by Breakwater; try again later`, false},
-		{"500 json", 500, `{"error":"boom"}`, nil, `Breakwater API returned 500: boom`, false},
+		{"500 json", 500, `{"status":500,"error":"Internal Server Error"}`, nil, `Breakwater API returned 500: {"status":500,"error":"Internal Server Error"}`, false},
 		{"500 body", 500, `<html>oops</html>`, nil, `Breakwater API returned 500: <html>oops</html>`, false},
-		{"422 details", 422, `{"error":"Validation failed","details":["platforms bad","x"]}`, nil, `Breakwater API returned 422: Validation failed: platforms bad; x`, false},
+		{"422 validation", 422, `{"type":"https://www.breakwaterapp.com/docs/api/errors#validation_failed","title":"Validation failed","status":422,"detail":"Platforms bad and x.","code":"validation_failed","errors":[{"detail":"Platforms bad"},{"detail":"x"}]}`, nil, `Breakwater API returned 422: Platforms bad and x.`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -388,10 +388,10 @@ func TestStartAndCompleteBundle(t *testing.T) {
 func TestCompleteBundleConflict(t *testing.T) {
 	c, _ := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(409)
-		io.WriteString(w, `{"error":"Bundle already completed"}`)
+		io.WriteString(w, `{"type":"https://www.breakwaterapp.com/docs/api/errors#bundle_already_completed","title":"T","status":409,"detail":"This bundle is already completed.","code":"bundle_already_completed"}`)
 	}))
 	err := c.CompleteBundle(context.Background(), "x", 1)
-	if err == nil || err.Error() != "Breakwater API returned 409: Bundle already completed" {
+	if err == nil || err.Error() != "Breakwater API returned 409: This bundle is already completed." {
 		t.Fatal(err)
 	}
 }

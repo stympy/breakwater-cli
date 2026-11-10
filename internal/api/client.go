@@ -128,22 +128,21 @@ func checkStatus(resp *http.Response) error {
 		return nil
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// The API's errors are RFC 9457 problem details: branch on code, show
+	// detail (which already includes every validation message).
 	var parsed struct {
-		Error   string   `json:"error"`
-		Details []string `json:"details"`
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
 	}
 	_ = json.Unmarshal(raw, &parsed)
-	msg := parsed.Error
-	if len(parsed.Details) > 0 {
-		msg += ": " + strings.Join(parsed.Details, "; ")
-	}
+	msg := parsed.Detail
 	e := &Error{Status: resp.StatusCode}
 	switch {
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
 		e.Message = fmt.Sprintf("Breakwater API redirected to %s; refusing to follow with credentials", resp.Header.Get("Location"))
 	case resp.StatusCode == http.StatusUnauthorized:
 		e.Message = "the API refused the credentials (use a customer pull token)"
-	case resp.StatusCode == http.StatusForbidden && parsed.Error == "plan_required":
+	case resp.StatusCode == http.StatusForbidden && parsed.Code == "plan_required":
 		e.Message = "air-gapped bundles aren't included in this vendor's Breakwater plan"
 	case resp.StatusCode == http.StatusTooManyRequests:
 		if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs >= 0 {

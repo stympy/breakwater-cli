@@ -62,7 +62,7 @@ func (a *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.started = append(a.started, body.Platforms)
 		if a.startStatus != 0 {
 			w.WriteHeader(a.startStatus)
-			w.Write([]byte(`{"error":"boom"}`))
+			w.Write([]byte(`{"code":"validation_failed","detail":"boom"}`))
 			return
 		}
 		w.WriteHeader(201)
