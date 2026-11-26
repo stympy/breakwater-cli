@@ -22,6 +22,7 @@ type fakeVendorAPI struct {
 	postPath  string
 	createErr string // problem body to answer the create with
 	createSt  int
+	createOK  string // body to answer a successful create with (default: a release)
 	repoCalls int
 }
 
@@ -49,6 +50,10 @@ func newFakeVendorAPI(t *testing.T) *fakeVendorAPI {
 			json.NewDecoder(r.Body).Decode(&body)
 			f.posted = body
 			w.WriteHeader(201)
+			if f.createOK != "" {
+				w.Write([]byte(f.createOK))
+				return
+			}
 			w.Write([]byte(`{"data":{"id":"rel_1","product_id":"prod_1","version":"2.4.1+b.5","status":"published","images":[{"reference":"r/api:1"}],"files":[{"name":"a.txt","size":2}]}}`))
 		default:
 			w.WriteHeader(404)
@@ -249,5 +254,39 @@ func TestVendorDoesNotFollowRedirects(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "refusing to follow") {
 		t.Fatalf("stderr %q", errb)
+	}
+}
+
+func TestVendorReleaseCreateRejectsNonObjectData(t *testing.T) {
+	for _, body := range []string{`{"data":null}`, `{}`, `{"data":[]}`, `{"data":"x"}`} {
+		for _, asJSON := range []bool{false, true} {
+			f := newFakeVendorAPI(t)
+			f.createOK = body
+			ios, _, errb := testIO("", vendorEnv)
+			args := []string{"vendor", "releases", "create", "prod_1", "1", "--host", f.srv.URL, "--notes", "n"}
+			if asJSON {
+				args = append(args, "--json")
+			}
+			if code := execute(ios, args); code == 0 || !strings.Contains(errb.String(), "invalid release") {
+				t.Fatalf("%s json=%v: exit %d, stderr %q", body, asJSON, code, errb)
+			}
+		}
+	}
+}
+
+func TestReadFilesPathWithEquals(t *testing.T) {
+	dir := t.TempDir()
+	eq := filepath.Join(dir, "app=1.2.tar.gz")
+	os.WriteFile(eq, []byte("x"), 0o600)
+	got, err := readFiles([]string{eq})
+	if err != nil || len(got) != 1 || got[0].Name != "app=1.2.tar.gz" {
+		t.Fatalf("existing path with =: %v %v", got, err)
+	}
+	got, err = readFiles([]string{eq + "=renamed.gz"})
+	if err != nil || got[0].Name != "renamed.gz" {
+		t.Fatalf("explicit name: %v %v", got, err)
+	}
+	if _, err := readFiles([]string{filepath.Join(dir, "missing=1.gz")}); err == nil {
+		t.Fatal("missing path with = should fail")
 	}
 }

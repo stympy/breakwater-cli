@@ -141,7 +141,7 @@ commands use are never sent.`,
 	f.StringVar(&notesFile, "notes-file", "", "read release notes from this file (- for stdin)")
 	f.StringArrayVar(&images, "image", nil, "a repository image, <repository id or name>:<tag> (repeatable)")
 	f.StringArrayVar(&externals, "external-image", nil, "an external image reference, e.g. postgres:16.4 (repeatable)")
-	f.StringArrayVar(&files, "file", nil, "a file to attach, <path>[=<name in the release>] (repeatable)")
+	f.StringArrayVar(&files, "file", nil, "a file to attach, <path>[=<name in the release>] (repeatable; a path containing = that does not exist needs an explicit =<name>)")
 	f.BoolVar(&asJSON, "json", false, "print the created release as JSON, with its URL as \"url\"")
 	return cmd
 }
@@ -161,7 +161,11 @@ func readFiles(specs []string) ([]api.ReleaseFile, error) {
 	var out []api.ReleaseFile
 	for _, spec := range specs {
 		path, name := spec, ""
-		if i := strings.LastIndex(spec, "="); i >= 0 {
+		// A spec that is itself an existing file is a bare path, even when it
+		// contains "="; otherwise the last "=" starts the release file name.
+		if _, statErr := os.Stat(spec); statErr == nil {
+			// bare path
+		} else if i := strings.LastIndex(spec, "="); i >= 0 {
 			path, name = spec[:i], spec[i+1:]
 			if name == "" {
 				return nil, fmt.Errorf("--file %q: the name after = is empty", spec)

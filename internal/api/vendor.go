@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -221,6 +222,9 @@ func (c *VendorClient) CreateRelease(ctx context.Context, product string, rel Ne
 	path := "/api/v1/vendor/products/" + url.PathEscape(product) + "/releases"
 	if err := c.do(ctx, http.MethodPost, path, "", map[string]any{"release": rel}, &out); err != nil {
 		return nil, err
+	}
+	if trimmed := bytes.TrimSpace(out.Data); len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("Breakwater API returned an invalid release: data is not an object")
 	}
 	var cr CreatedRelease
 	if err := json.Unmarshal(out.Data, &cr); err != nil {
