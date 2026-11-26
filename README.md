@@ -96,6 +96,44 @@ chmod +x bin/breakwater_linux_amd64
 bin/breakwater_linux_amd64 bundle verify api-2.4.1.bwbundle.tar
 ```
 
+### `breakwater vendor releases create <product id> <version>`
+
+For vendors: creates and publishes a release from a script or CI, through the
+vendor API. It does not use the customer credentials above. It needs a `vapi_`
+API token with the `write` scope (create one under **API tokens** in the vendor
+portal), read from `BREAKWATER_API_TOKEN` or `--token`. Prefer the variable:
+flags show up in process lists. `<product id>` is the product's id as the
+vendor API shows it, not its slug.
+
+```bash
+export BREAKWATER_API_TOKEN=vapi_...
+breakwater vendor releases create prod_abc123 2.4.1 \
+  --notes-file CHANGELOG.md \
+  --image api:2.4.1 --image worker:2.4.1 \
+  --external-image postgres:16.4 \
+  --file compose.yaml --file ./dist/install.sh=install.sh
+```
+
+- `--notes <text>` or `--notes-file <path>` (`-` for stdin): the release notes.
+- `--image <repository>:<tag>`: an image from one of your repositories, which
+  must already be pushed. The repository is its id or its name; the CLI looks
+  it up with `GET /api/v1/vendor/repositories` (a name shared by several
+  repositories is an error: use the id). Repeatable.
+- `--external-image <reference>`: an image hosted elsewhere, such as
+  `postgres:16.4`. Repeatable.
+- `--file <path>[=<name>]`: attach a file, named after the path's last element
+  unless you give `=<name>`. Sent base64-encoded in the request. Repeatable.
+- `--host <origin>`: another API origin, for testing.
+- `--json`: print the created release as JSON (the API's release object plus
+  `url`, the release's page in the vendor portal) instead of a summary line and
+  that URL.
+
+On success the exit code is 0 and the release is published. On any failure it
+exits 1 with the API's error title and detail on stderr, for example
+`Insufficient scope: This needs a token with the write scope.` or a validation
+error such as a version that already exists. Nothing is printed to stdout, so
+`--json` output is always valid JSON.
+
 ### `breakwater bundle verify <file>`
 
 Checks the bundle's structure and that every entry matches the digests
